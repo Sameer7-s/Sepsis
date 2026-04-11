@@ -1,27 +1,22 @@
-<<<<<<< HEAD
 ---
-title: Sepsis Ai Agent
-emoji: 📚
-colorFrom: pink
-colorTo: gray
+title: Sepsis AI Agent
+emoji: 🏥
+colorFrom: blue
+colorTo: purple
 sdk: docker
+app_port: 7860
 pinned: false
-license: mit
-short_description: AI-powered sepsis simulation engine with step-by-step clinic
 ---
 
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
-=======
----
-title: Sepsis Ai Agent
-emoji: 📚
-colorFrom: pink
-colorTo: gray
-sdk: docker
-pinned: false
-license: mit
-short_description: AI-powered sepsis simulation engine with step-by-step clinic
----
+# Sepsis AI Agent
 
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
->>>>>>> b1ff219 (update backend and inference)
+OpenEnv-style sepsis management environment exposing:
+- /health
+- /reset
+- /step
+- /state
+
+This repository contains:
+- backend_api.py
+- inference.py
+- openenv.yaml
