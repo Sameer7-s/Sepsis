@@ -561,24 +561,28 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+
+# Accept both empty and JSON bodies for /reset
+from fastapi import Request
+
 @app.post("/reset", response_model=EpisodeStateResponse)
-def reset(request: Optional[ResetRequest] = Body(default=None)) -> EpisodeStateResponse:
+async def reset(request: Request) -> EpisodeStateResponse:
     try:
+        try:
+            data = await request.json()
+        except Exception:
+            data = None
         scenario = "early_sepsis"
-        if request is not None and getattr(request, "scenario", None):
-            scenario = request.scenario
-        
+        if data and isinstance(data, dict) and data.get("scenario"):
+            scenario = data["scenario"]
         # Validate scenario
         if not scenario or not isinstance(scenario, str):
             raise ValueError("scenario must be a non-empty string")
-        
         normalized_name = normalize_scenario_name(scenario)
         if normalized_name not in SUPPORTED_SCENARIOS:
             raise ValueError(f"Invalid scenario '{scenario}'. Supported: {SUPPORTED_SCENARIOS}")
-        
         payload = env.reset(normalized_name)
         return EpisodeStateResponse(**payload)
-
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid request: {str(exc)}") from exc
     except FileNotFoundError as exc:
