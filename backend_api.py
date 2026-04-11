@@ -249,6 +249,12 @@ class SepsisEnvironment:
         scenario = episode["scenario"]
         state = episode["state"]
         hidden = episode["hidden"]
+        
+        # Validate action
+        if not action or not isinstance(action, str):
+            raise ValueError(f"Invalid action: {action}")
+        if action not in self.ACTIONS:
+            raise ValueError(f"Unknown action '{action}'. Must be one of: {self.ACTIONS}")
 
         step_reward = -0.01
         relevant = scenario["requirements"]
@@ -545,11 +551,20 @@ def reset(request: Optional[ResetRequest] = Body(default=None)) -> EpisodeStateR
         scenario = "early_sepsis"
         if request is not None and getattr(request, "scenario", None):
             scenario = request.scenario
-
+        
+        # Validate scenario
+        if not scenario or not isinstance(scenario, str):
+            raise ValueError("scenario must be a non-empty string")
+        
         normalized_name = normalize_scenario_name(scenario)
+        if normalized_name not in SUPPORTED_SCENARIOS:
+            raise ValueError(f"Invalid scenario '{scenario}'. Supported: {SUPPORTED_SCENARIOS}")
+        
         payload = env.reset(normalized_name)
         return EpisodeStateResponse(**payload)
 
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {str(exc)}") from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -559,8 +574,14 @@ def reset(request: Optional[ResetRequest] = Body(default=None)) -> EpisodeStateR
 @app.get("/state", response_model=EpisodeStateResponse)
 def state(episode_id: str) -> EpisodeStateResponse:
     try:
+        # Validate episode_id
+        if not episode_id or not isinstance(episode_id, str):
+            raise ValueError("episode_id is required and must be a non-empty string")
+        
         payload = env.state(episode_id)
         return EpisodeStateResponse(**payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {str(exc)}") from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     except Exception as exc:
@@ -570,8 +591,18 @@ def state(episode_id: str) -> EpisodeStateResponse:
 @app.post("/step", response_model=StepResponse)
 def step(request: StepRequest) -> StepResponse:
     try:
+        # Validate request
+        if not request.episode_id or not isinstance(request.episode_id, str):
+            raise ValueError("episode_id is required and must be a string")
+        if not request.action or not isinstance(request.action, str):
+            raise ValueError("action is required and must be a string")
+        if request.action not in SepsisEnvironment.ACTIONS:
+            raise ValueError(f"Invalid action '{request.action}'. Must be one of: {SepsisEnvironment.ACTIONS}")
+        
         payload = env.step(request.episode_id, request.action)
         return StepResponse(**payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {str(exc)}") from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     except Exception as exc:
@@ -579,9 +610,9 @@ def step(request: StepRequest) -> StepResponse:
 
 
 def run_server(host: str = "127.0.0.1", port: int = 7860) -> None:
+    """Start the server (used by server/app.py)."""
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+# NOTE: Server startup should ONLY be done via server/app.py, not directly
+# This module is meant to be imported and used as a FastAPI app module only

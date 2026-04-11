@@ -9,4 +9,5 @@ COPY . .
 
 EXPOSE 7860
 
-CMD ["python", "backend_api.py"]
+# Use server/app.py as the proper entry point to avoid duplicate server instances
+CMD ["python", "server/app.py"]

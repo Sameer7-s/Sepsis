@@ -20,6 +20,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 BACKEND_BASE = os.getenv("SEPSIS_BACKEND_BASE", "http://127.0.0.1:7860").rstrip("/")
+# Validate BACKEND_BASE is not empty
+if not BACKEND_BASE:
+    print("[ERROR] BACKEND_BASE is empty or not set", file=sys.stderr)
+    sys.exit(1)
+    
 OPENENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "openenv.yaml")
 
 SCENARIOS = ["early_sepsis", "severe_sepsis", "septic_shock"]
@@ -75,6 +80,15 @@ def http_json(
     payload: Optional[Dict[str, Any]] = None,
     timeout: float = 8.0,
 ) -> Dict[str, Any]:
+    """Make HTTP request and validate JSON response."""
+    # Validate inputs
+    if not method or not isinstance(method, str):
+        raise RuntimeError(f"Invalid HTTP method: {method}")
+    if not path or not isinstance(path, str):
+        raise RuntimeError(f"Invalid path: {path}")
+    if not path.startswith("/"):
+        raise RuntimeError(f"Path must start with '/', got: {path}")
+    
     url = f"{BACKEND_BASE}{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"}
@@ -82,7 +96,14 @@ def http_json(
 
     try:
         with urlopen(req, timeout=timeout) as resp:
+            # Validate response status
+            if resp.status < 200 or resp.status >= 300:
+                raise RuntimeError(f"HTTP {resp.status} from {url}")
+            
             body = resp.read().decode("utf-8")
+            if not body:
+                raise RuntimeError(f"Empty response body from {url}")
+                
             parsed = json.loads(body)
             if not isinstance(parsed, dict):
                 raise RuntimeError(f"Expected JSON object from {url}, got {type(parsed).__name__}")
@@ -96,18 +117,29 @@ def http_json(
     except URLError as exc:
         raise RuntimeError(f"Could not reach API at {url}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid JSON from {url}") from exc
+        raise RuntimeError(f"Invalid JSON from {url}: {exc}") from exc
 
 
 def wait_for_backend(timeout: float = 30.0) -> bool:
+    """Wait for backend health check with detailed logging."""
     start = time.time()
+    attempt = 0
     while time.time() - start < timeout:
+        attempt += 1
         try:
             result = http_json("GET", "/health", timeout=2.0)
+            # Validate response structure
+            if not isinstance(result, dict):
+                raise RuntimeError(f"Expected dict response, got {type(result).__name__}")
             if result.get("status") == "ok":
+                print(f"[INFO] Backend health check passed (attempt {attempt})")
                 return True
-        except Exception:
-            pass
+            else:
+                print(f"[DEBUG] Backend health check returned status: {result.get('status')}")
+        except Exception as exc:
+            elapsed = time.time() - start
+            if elapsed < 5:  # Only log first few attempts to avoid spam
+                print(f"[DEBUG] Health check attempt {attempt} failed: {exc}")
         time.sleep(0.5)
     return False
 
