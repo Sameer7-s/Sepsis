@@ -1,0 +1,111 @@
+<<<<<<< HEAD
+{
+  "name": "septic_shock",
+  "severity": "shock",
+  "max_steps": 12,
+  "initial_state": {
+    "heart_rate": 136,
+    "systolic_bp": 83,
+    "diastolic_bp": 43,
+    "mean_arterial_pressure": 56,
+    "respiratory_rate": 32,
+    "oxygen_saturation": 88,
+    "temperature": 39.4,
+    "lactate": 4.8,
+    "sofa_score": 10
+  },
+  "target_state": {
+    "heart_rate": 90,
+    "mean_arterial_pressure": 82,
+    "respiratory_rate": 16,
+    "oxygen_saturation": 98,
+    "temperature": 37.0,
+    "lactate": 1.5,
+    "sofa_score": 2
+  },
+  "requirements": {
+    "needs_vasopressors": true,
+    "needs_source_control": true,
+    "essential_actions": ["administer_antibiotics", "give_fluids", "oxygen_therapy", "start_vasopressors", "perform_source_control"]
+  },
+  "progression": {
+    "temp_increase_if_no_antibiotics": 0.22,
+    "hr_increase_if_no_antibiotics": 2.5,
+    "rr_increase_if_no_antibiotics": 1.4,
+    "lactate_increase_if_no_antibiotics": 0.30,
+    "sofa_increase_if_no_antibiotics": 0.35,
+    "temp_increase_if_no_source_control": 0.10,
+    "lactate_increase_if_no_source_control": 0.15,
+    "map_drop_if_no_vasopressors": 2.2,
+    "spo2_drop_if_no_vasopressors": 0.9
+  },
+  "termination": {
+    "stable_map_min": 70,
+    "stable_spo2_min": 94,
+    "stable_lactate_max": 2.2,
+    "stable_sofa_max": 3.0,
+    "critical_map_below": 45,
+    "critical_spo2_below": 82,
+    "critical_lactate_above": 8.0
+  },
+  "reward_normalization": {
+    "min_cumulative_reward": -1.5,
+    "max_cumulative_reward": 1.4
+  }
+}
+=======
+{
+  "name": "septic_shock",
+  "severity": "shock",
+  "max_steps": 12,
+  "initial_state": {
+    "heart_rate": 136,
+    "systolic_bp": 83,
+    "diastolic_bp": 43,
+    "mean_arterial_pressure": 56,
+    "respiratory_rate": 32,
+    "oxygen_saturation": 88,
+    "temperature": 39.4,
+    "lactate": 4.8,
+    "sofa_score": 10
+  },
+  "target_state": {
+    "heart_rate": 90,
+    "mean_arterial_pressure": 82,
+    "respiratory_rate": 16,
+    "oxygen_saturation": 98,
+    "temperature": 37.0,
+    "lactate": 1.5,
+    "sofa_score": 2
+  },
+  "requirements": {
+    "needs_vasopressors": true,
+    "needs_source_control": true,
+    "essential_actions": ["administer_antibiotics", "give_fluids", "oxygen_therapy", "start_vasopressors", "perform_source_control"]
+  },
+  "progression": {
+    "temp_increase_if_no_antibiotics": 0.22,
+    "hr_increase_if_no_antibiotics": 2.5,
+    "rr_increase_if_no_antibiotics": 1.4,
+    "lactate_increase_if_no_antibiotics": 0.30,
+    "sofa_increase_if_no_antibiotics": 0.35,
+    "temp_increase_if_no_source_control": 0.10,
+    "lactate_increase_if_no_source_control": 0.15,
+    "map_drop_if_no_vasopressors": 2.2,
+    "spo2_drop_if_no_vasopressors": 0.9
+  },
+  "termination": {
+    "stable_map_min": 70,
+    "stable_spo2_min": 94,
+    "stable_lactate_max": 2.2,
+    "stable_sofa_max": 3.0,
+    "critical_map_below": 45,
+    "critical_spo2_below": 82,
+    "critical_lactate_above": 8.0
+  },
+  "reward_normalization": {
+    "min_cumulative_reward": -1.5,
+    "max_cumulative_reward": 1.4
+  }
+}
+>>>>>>> b1ff219 (update backend and inference)
