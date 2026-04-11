@@ -160,23 +160,47 @@ def normalize_severity(severity: str) -> str:
 
 
 def validate_reset_response(data: Dict[str, Any]) -> None:
+    """Validate /reset response has all required fields and correct types."""
     required = ["episode_id", "severity", "state", "normalized_score"]
     missing = [k for k in required if k not in data]
     if missing:
         raise RuntimeError(f"/reset response missing keys: {missing}")
-    if not isinstance(data["state"], dict):
-        raise RuntimeError("/reset response field 'state' must be an object")
+    
+    # Validate types
+    if not isinstance(data["episode_id"], str) or not data["episode_id"].strip():
+        raise RuntimeError(f"/reset response field 'episode_id' must be a non-empty string")
+    if not isinstance(data["severity"], str) or not data["severity"].strip():
+        raise RuntimeError(f"/reset response field 'severity' must be a non-empty string")
+    if not isinstance(data["state"], dict) or not data["state"]:
+        raise RuntimeError("/reset response field 'state' must be a non-empty dict")
+    if not isinstance(data["normalized_score"], (int, float)):
+        raise RuntimeError("/reset response field 'normalized_score' must be numeric")
+    if data["normalized_score"] < 0.0 or data["normalized_score"] > 1.0:
+        raise RuntimeError(f"/reset response 'normalized_score' out of range: {data['normalized_score']}")
 
 
 def validate_step_response(data: Dict[str, Any]) -> None:
+    """Validate /step response has all required fields and correct types."""
     required = ["reward", "state", "normalized_score", "done", "step_count", "message"]
     missing = [k for k in required if k not in data]
     if missing:
         raise RuntimeError(f"/step response missing keys: {missing}")
-    if not isinstance(data["state"], dict):
-        raise RuntimeError("/step response field 'state' must be an object")
+    
+    # Validate types
+    if not isinstance(data["state"], dict) or not data["state"]:
+        raise RuntimeError("/step response field 'state' must be a non-empty dict")
     if not isinstance(data["done"], bool):
         raise RuntimeError("/step response field 'done' must be a bool")
+    if not isinstance(data["step_count"], int) or data["step_count"] < 0:
+        raise RuntimeError("/step response field 'step_count' must be non-negative int")
+    if not isinstance(data["reward"], (int, float)):
+        raise RuntimeError("/step response field 'reward' must be numeric")
+    if not isinstance(data["normalized_score"], (int, float)):
+        raise RuntimeError("/step response field 'normalized_score' must be numeric")
+    if not isinstance(data["message"], str) or not data["message"].strip():
+        raise RuntimeError("/step response field 'message' must be a non-empty string")
+    if data["normalized_score"] < 0.0 or data["normalized_score"] > 1.0:
+        raise RuntimeError(f"/step response 'normalized_score' out of range: {data['normalized_score']}")
 
 
 def get_llm_client() -> Optional[Any]:
@@ -201,10 +225,13 @@ def normalize_action_text(text: str) -> str:
 
 
 def match_allowed_action(raw: str) -> Optional[str]:
+    """Match raw action string to allowed actions with validation."""
     if not raw:
         return None
 
     normalized = normalize_action_text(raw)
+    if not normalized:
+        return None
 
     if normalized in ALLOWED_ACTIONS:
         return normalized
@@ -232,6 +259,7 @@ def match_allowed_action(raw: str) -> Optional[str]:
     if mapped in ALLOWED_ACTIONS:
         return mapped
 
+    # Fuzzy matching as fallback
     for action in ALLOWED_ACTIONS:
         if normalized.startswith(action) or action in normalized:
             return action
@@ -345,6 +373,11 @@ def run_episode(
     scenario: str,
     client: Optional[Any],
 ) -> Tuple[float, List[Dict[str, Any]]]:
+    """Run a single episode with comprehensive validation."""
+    # Validate scenario
+    if scenario not in SCENARIOS:
+        raise ValueError(f"Invalid scenario '{scenario}'. Must be one of: {SCENARIOS}")
+    
     reset = http_json("POST", "/reset", {"scenario": scenario})
     validate_reset_response(reset)
 
@@ -366,12 +399,16 @@ def run_episode(
 
         if client is not None and local_step_count == 1:
             action = llm_choose_action(client, state, history, severity)
+            if action not in ALLOWED_ACTIONS:
+                print(f"[WARNING] LLM returned invalid action '{action}', using deterministic fallback")
+                action = deterministic_action(state, history, severity)
             print(f"[LLM ] step={local_step_count} action={action}")
         else:
             action = deterministic_action(state, history, severity)
-
+        
+        # Final validation before sending to backend
         if action not in ALLOWED_ACTIONS:
-            action = deterministic_action(state, history, severity)
+            raise RuntimeError(f"Invalid action selected: {action}. Must be one of: {ALLOWED_ACTIONS}")
 
         result = http_json("POST", "/step", {"episode_id": episode_id, "action": action})
         validate_step_response(result)
@@ -409,12 +446,13 @@ def run_episode(
 
 
 def build_final_payload(scores_by_scenario: Dict[str, float]) -> Dict[str, Any]:
+    """Build and validate final submission payload."""
     early = clamp_open_interval(scores_by_scenario.get("early_sepsis", DEFAULT_SAFE_SCORE))
     severe = clamp_open_interval(scores_by_scenario.get("severe_sepsis", DEFAULT_SAFE_SCORE))
     shock = clamp_open_interval(scores_by_scenario.get("septic_shock", DEFAULT_SAFE_SCORE))
     final_score = clamp_open_interval((early + severe + shock) / 3.0)
 
-    return {
+    payload = {
         "final_score": float(final_score),
         "task_scores": {
             "early_sepsis": float(early),
@@ -422,6 +460,48 @@ def build_final_payload(scores_by_scenario: Dict[str, float]) -> Dict[str, Any]:
             "septic_shock": float(shock),
         },
     }
+    
+    # Validate payload structure
+    validate_payload(payload)
+    return payload
+
+
+def validate_payload(payload: Dict[str, Any]) -> None:
+    """Validate final submission payload has all required fields and correct types."""
+    # Check required top-level keys
+    required_keys = ["final_score", "task_scores"]
+    missing = [k for k in required_keys if k not in payload]
+    if missing:
+        raise RuntimeError(f"Payload missing required keys: {missing}")
+    
+    # Check final_score is a valid number
+    final_score = payload["final_score"]
+    if not isinstance(final_score, (int, float)):
+        raise RuntimeError(f"final_score must be numeric, got {type(final_score).__name__}")
+    if final_score < 0.0 or final_score > 1.0:
+        raise RuntimeError(f"final_score must be in range [0.0, 1.0], got {final_score}")
+    
+    # Check task_scores structure
+    task_scores = payload["task_scores"]
+    if not isinstance(task_scores, dict):
+        raise RuntimeError(f"task_scores must be a dict, got {type(task_scores).__name__}")
+    
+    # Check all required scenarios are present
+    required_scenarios = {"early_sepsis", "severe_sepsis", "septic_shock"}
+    missing_scenarios = required_scenarios - set(task_scores.keys())
+    if missing_scenarios:
+        raise RuntimeError(f"task_scores missing scenarios: {missing_scenarios}")
+    
+    # Validate each scenario score
+    for scenario, score in task_scores.items():
+        if scenario not in required_scenarios:
+            raise RuntimeError(f"Unknown scenario '{scenario}' in task_scores")
+        if not isinstance(score, (int, float)):
+            raise RuntimeError(f"task_scores[{scenario}] must be numeric, got {type(score).__name__}")
+        if score < 0.0 or score > 1.0:
+            raise RuntimeError(f"task_scores[{scenario}] must be in range [0.0, 1.0], got {score}")
+    
+    print("[VALIDATION] ✓ Payload structure is valid")
 
 
 def main() -> None:
@@ -433,6 +513,7 @@ def main() -> None:
                 file=sys.stderr,
             )
             fallback = build_final_payload({})
+            print("[FINAL] submission payload (backend unavailable - using fallback):")
             print(json.dumps(fallback, indent=2, sort_keys=True))
             sys.exit(1)
 
@@ -441,16 +522,26 @@ def main() -> None:
             print(f"[INFO] OpenEnv spec: {OPENENV_PATH}")
 
         client = get_llm_client()
+        if client:
+            print("[INFO] LLM client initialized - will use LLM decision-making")
+        else:
+            print("[INFO] Using deterministic policy (no LLM available)")
+        
         scores_by_scenario: Dict[str, float] = {}
 
+        # Run all scenarios
         for scenario in SCENARIOS:
             try:
+                print(f"[SCENARIO] Starting {scenario}...")
                 score, _history = run_episode(scenario, client)
                 scores_by_scenario[scenario] = clamp_open_interval(score)
+                print(f"[SCENARIO] Completed {scenario}: score={score:.4f}")
             except Exception as exc:
                 print(f"[ERROR] scenario={scenario} failed: {exc}", file=sys.stderr)
                 scores_by_scenario[scenario] = DEFAULT_SAFE_SCORE
+                print(f"[WARNING] Using default safe score for {scenario}")
 
+        # Build and validate final payload
         payload = build_final_payload(scores_by_scenario)
         print("[FINAL] submission payload:")
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -460,7 +551,7 @@ def main() -> None:
     except Exception as exc:
         print(f"[FATAL] inference failed: {exc}", file=sys.stderr)
         fallback = build_final_payload({})
-        print("[FINAL] fallback payload:")
+        print("[FINAL] fallback payload (error occurred during execution):")
         print(json.dumps(fallback, indent=2, sort_keys=True))
         sys.exit(1)
 
