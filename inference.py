@@ -1,31 +1,47 @@
+"""
+Sepsis Management OpenEnv — optimized submission-safe inference loop.
+
+Goals:
+- Never starts a backend server.
+- Waits for backend health only.
+- Avoids unhandled crashes where possible.
+- Uses deterministic policy by default.
+- Optionally uses LLM if API_BASE_URL + API_KEY are set.
+- Prints validator-friendly final JSON payload.
+"""
+
 import json
 import math
 import os
-import threading
-import uuid
-from copy import deepcopy
-from typing import Any, Dict, List, Literal, Optional
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-from fastapi import Body, FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import uvicorn
+BACKEND_BASE = os.getenv("SEPSIS_BACKEND_BASE", "http://127.0.0.1:7860").rstrip("/")
+OPENENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "openenv.yaml")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SCENARIO_DIR = os.path.join(BASE_DIR, "scenarios")
+SCENARIOS = ["early_sepsis", "severe_sepsis", "septic_shock"]
 
-PULSE_PRESSURE_MMHG: float = 40.0
-_SBP_OFFSET = 2.0 * PULSE_PRESSURE_MMHG / 3.0
-_DBP_OFFSET = PULSE_PRESSURE_MMHG / 3.0
-
-SUPPORTED_SCENARIOS = {"early_sepsis", "severe_sepsis", "septic_shock"}
+ALLOWED_ACTIONS = [
+    "observe",
+    "administer_antibiotics",
+    "give_fluids",
+    "oxygen_therapy",
+    "start_vasopressors",
+    "perform_source_control",
+    "noop",
+]
 
 DEFAULT_SAFE_SCORE = 0.5
-DEFAULT_SAFE_REWARD = 0.5
-EPS = 1e-6
+SAFE_MIN_SCORE = 0.01
+SAFE_MAX_SCORE = 0.99
+MAX_STEPS = 20
 
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
+API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
+API_KEY = (os.getenv("API_KEY") or os.getenv("HF_TOKEN") or "").strip()
 
 
 def safe_float(value: Any, default: float = DEFAULT_SAFE_SCORE) -> float:
@@ -41,544 +57,381 @@ def safe_float(value: Any, default: float = DEFAULT_SAFE_SCORE) -> float:
 
 
 def clamp_open_interval(value: float) -> float:
-    value = float(value)
-    if value != value:  # NaN check
-        return 0.5
-    if value <= 0.0:
-        return EPS
-    if value >= 1.0:
-        return 1.0 - EPS
-    return float(value)
+    x = safe_float(value, DEFAULT_SAFE_SCORE)
+    if x <= 0.0:
+        return SAFE_MIN_SCORE
+    if x >= 1.0:
+        return SAFE_MAX_SCORE
+    if x < SAFE_MIN_SCORE:
+        return SAFE_MIN_SCORE
+    if x > SAFE_MAX_SCORE:
+        return SAFE_MAX_SCORE
+    return x
 
 
-def finalize_score(value: Any) -> float:
-    return clamp_open_interval(safe_float(value, DEFAULT_SAFE_SCORE))
+def http_json(
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: float = 8.0,
+) -> Dict[str, Any]:
+    url = f"{BACKEND_BASE}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    req = Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"Expected JSON object from {url}, got {type(parsed).__name__}")
+            return parsed
+    except HTTPError as exc:
+        try:
+            error_body = exc.read().decode("utf-8")
+        except Exception:
+            error_body = str(exc)
+        raise RuntimeError(f"HTTP {exc.code} calling {path}: {error_body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not reach API at {url}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON from {url}") from exc
 
 
-def finalize_reward(value: Any) -> float:
-    return clamp_open_interval(safe_float(value, DEFAULT_SAFE_REWARD))
+def wait_for_backend(timeout: float = 30.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            result = http_json("GET", "/health", timeout=2.0)
+            if result.get("status") == "ok":
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
 
 
-def normalize_scenario_name(name: str) -> str:
-    value = (name or "").strip().lower()
-    aliases = {
-        "mild": "early_sepsis",
-        "mild_sepsis": "early_sepsis",
-        "early": "early_sepsis",
-        "early_sepsis": "early_sepsis",
-        "severe": "severe_sepsis",
-        "severe_sepsis": "severe_sepsis",
-        "shock": "septic_shock",
-        "septic_shock": "septic_shock",
+def normalize_severity(severity: str) -> str:
+    value = (severity or "").strip().lower()
+    mapping = {
+        "early": "early",
+        "early_sepsis": "early",
+        "mild": "early",
+        "mild_sepsis": "early",
+        "severe": "severe",
+        "severe_sepsis": "severe",
+        "shock": "shock",
+        "septic_shock": "shock",
     }
-    return aliases.get(value, value)
+    return mapping.get(value, value)
 
 
-def load_scenario(name: str) -> Dict[str, Any]:
-    normalized_name = normalize_scenario_name(name)
+def validate_reset_response(data: Dict[str, Any]) -> None:
+    required = ["episode_id", "severity", "state", "normalized_score"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise RuntimeError(f"/reset response missing keys: {missing}")
+    if not isinstance(data["state"], dict):
+        raise RuntimeError("/reset response field 'state' must be an object")
 
-    if normalized_name not in SUPPORTED_SCENARIOS:
-        raise FileNotFoundError(f"Unknown scenario: {name}")
 
-    path = os.path.join(SCENARIO_DIR, f"{normalized_name}.json")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Scenario file not found for '{normalized_name}'. Expected: {path}"
+def validate_step_response(data: Dict[str, Any]) -> None:
+    required = ["reward", "state", "normalized_score", "done", "step_count", "message"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise RuntimeError(f"/step response missing keys: {missing}")
+    if not isinstance(data["state"], dict):
+        raise RuntimeError("/step response field 'state' must be an object")
+    if not isinstance(data["done"], bool):
+        raise RuntimeError("/step response field 'done' must be a bool")
+
+
+def get_llm_client() -> Optional[Any]:
+    if not API_BASE_URL or not API_KEY or not MODEL_NAME:
+        return None
+
+    try:
+        from openai import OpenAI
+        return OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    except Exception as exc:
+        print(f"[LLM] unavailable, falling back to deterministic policy: {exc}")
+        return None
+
+
+def normalize_action_text(text: str) -> str:
+    if not text:
+        return ""
+    normalized = text.strip().lower()
+    for ch in ("-", " ", ".", ",", ":", ";"):
+        normalized = normalized.replace(ch, "_" if ch in ("-", " ") else "")
+    return normalized
+
+
+def match_allowed_action(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+
+    normalized = normalize_action_text(raw)
+
+    if normalized in ALLOWED_ACTIONS:
+        return normalized
+
+    alias_map = {
+        "antibiotics": "administer_antibiotics",
+        "administer_antibiotic": "administer_antibiotics",
+        "administer_antibiotics": "administer_antibiotics",
+        "give_antibiotics": "administer_antibiotics",
+        "fluids": "give_fluids",
+        "give_fluid": "give_fluids",
+        "give_fluids": "give_fluids",
+        "oxygen": "oxygen_therapy",
+        "oxygen_therapy": "oxygen_therapy",
+        "vasopressors": "start_vasopressors",
+        "start_vasopressor": "start_vasopressors",
+        "start_vasopressors": "start_vasopressors",
+        "source_control": "perform_source_control",
+        "perform_source_control": "perform_source_control",
+        "observe": "observe",
+        "noop": "noop",
+    }
+
+    mapped = alias_map.get(normalized)
+    if mapped in ALLOWED_ACTIONS:
+        return mapped
+
+    for action in ALLOWED_ACTIONS:
+        if normalized.startswith(action) or action in normalized:
+            return action
+
+    return None
+
+
+def llm_choose_action(
+    client: Optional[Any],
+    state: Dict[str, float],
+    history: List[Dict[str, Any]],
+    severity: str,
+) -> str:
+    if client is None:
+        return deterministic_action(state, history, severity)
+
+    recent_actions = [item.get("action", "") for item in history[-5:]]
+
+    system_prompt = (
+        "You are a clinical decision-support AI for sepsis management. "
+        "Choose exactly one next action from the allowed list. "
+        "Return only the exact action string."
+    )
+    user_prompt = (
+        f"Severity: {severity}\n"
+        f"State: {json.dumps(state, sort_keys=True)}\n"
+        f"Recent actions: {recent_actions}\n"
+        f"Allowed actions: {ALLOWED_ACTIONS}\n"
+        "Return only one exact allowed action."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=16,
+            temperature=0.0,
         )
+        raw = response.choices[0].message.content or ""
+        matched = match_allowed_action(raw)
+        if matched:
+            return matched
+        print(f"[LLM] invalid action {raw!r}, using deterministic fallback")
+    except Exception as exc:
+        print(f"[LLM] call failed, using deterministic fallback: {exc}")
 
-    with open(path, "r", encoding="utf-8") as f:
-        scenario = json.load(f)
-
-    scenario["name"] = normalized_name
-    return scenario
-
-
-class Observation(BaseModel):
-    heart_rate: float = Field(...)
-    systolic_bp: float = Field(...)
-    diastolic_bp: float = Field(...)
-    mean_arterial_pressure: float = Field(...)
-    respiratory_rate: float = Field(...)
-    oxygen_saturation: float = Field(...)
-    temperature: float = Field(...)
-    lactate: float = Field(...)
-    sofa_score: float = Field(...)
+    return deterministic_action(state, history, severity)
 
 
-ActionName = Literal[
-    "observe",
-    "administer_antibiotics",
-    "give_fluids",
-    "oxygen_therapy",
-    "start_vasopressors",
-    "perform_source_control",
-    "noop",
-]
+def deterministic_action(
+    state: Dict[str, float],
+    history: List[Dict[str, Any]],
+    severity: str,
+) -> str:
+    severity = normalize_severity(severity)
+    actions_taken = [str(item.get("action", "")) for item in history]
+    taken_set = set(actions_taken)
+    last_action = actions_taken[-1] if actions_taken else None
+
+    if "administer_antibiotics" not in taken_set:
+        return "administer_antibiotics"
+
+    spo2 = safe_float(state.get("oxygen_saturation"), 100.0)
+    rr = safe_float(state.get("respiratory_rate"), 18.0)
+    map_val = safe_float(state.get("mean_arterial_pressure"), 75.0)
+    lactate = safe_float(state.get("lactate"), 2.0)
+    sofa = safe_float(state.get("sofa_score"), 2.0)
+
+    if spo2 < 90.0:
+        return "oxygen_therapy"
+
+    if (spo2 < 94.0 or rr > 22.0) and last_action != "oxygen_therapy":
+        return "oxygen_therapy"
+
+    if severity == "shock":
+        if map_val < 65.0 and "start_vasopressors" not in taken_set:
+            return "start_vasopressors"
+        if (map_val < 68.0 or lactate > 3.5) and last_action != "give_fluids":
+            return "give_fluids"
+        if "perform_source_control" not in taken_set:
+            return "perform_source_control"
+
+    elif severity == "severe":
+        if (map_val < 70.0 or lactate > 2.5) and last_action != "give_fluids":
+            return "give_fluids"
+        if sofa >= 4.0 and "perform_source_control" not in taken_set:
+            return "perform_source_control"
+
+    elif severity == "early":
+        if lactate > 2.2 or map_val < 70.0:
+            return "give_fluids"
+        return "observe"
+
+    if lactate > 2.2 or map_val < 70.0:
+        return "give_fluids"
+
+    if spo2 < 96.0 and last_action != "oxygen_therapy":
+        return "oxygen_therapy"
+
+    return "observe"
 
 
-class ResetRequest(BaseModel):
-    scenario: str = "early_sepsis"
+def format_scenario_label(name: str) -> str:
+    return name.replace("_", " ").title()
 
 
-class StepRequest(BaseModel):
-    episode_id: str
-    action: ActionName
+def run_episode(
+    scenario: str,
+    client: Optional[Any],
+) -> Tuple[float, List[Dict[str, Any]]]:
+    reset = http_json("POST", "/reset", {"scenario": scenario})
+    validate_reset_response(reset)
 
+    episode_id = str(reset["episode_id"])
+    severity = normalize_severity(str(reset["severity"]))
+    state = dict(reset["state"])
+    history: List[Dict[str, Any]] = []
 
-class StepRecord(BaseModel):
-    step: int
-    action: str
-    reward: float
-    normalized_score: float
+    print(
+        f"[START] scenario={format_scenario_label(scenario)} "
+        f"severity={severity} episode={episode_id[:8]}"
+    )
 
+    final_score = clamp_open_interval(reset["normalized_score"])
+    local_step_count = 0
 
-class EpisodeStateResponse(BaseModel):
-    episode_id: str
-    scenario: str
-    severity: str
-    step_count: int
-    max_steps: int
-    done: bool
-    state: Observation
-    cumulative_reward: float
-    normalized_score: float
-    history: List[StepRecord]
+    while True:
+        local_step_count += 1
 
-
-class StepResponse(EpisodeStateResponse):
-    reward: float
-    message: str
-
-
-class HealthResponse(BaseModel):
-    status: str
-
-
-class SepsisEnvironment:
-    ACTIONS: List[str] = [
-        "observe",
-        "administer_antibiotics",
-        "give_fluids",
-        "oxygen_therapy",
-        "start_vasopressors",
-        "perform_source_control",
-        "noop",
-    ]
-
-    def __init__(self) -> None:
-        self.sessions: Dict[str, Dict[str, Any]] = {}
-        self.lock = threading.Lock()
-
-    def _get_target_state(self, scenario: Dict[str, Any]) -> Dict[str, float]:
-        return scenario["target_state"]
-
-    def _stability_score(self, state: Dict[str, float], scenario: Dict[str, Any]) -> float:
-        target = self._get_target_state(scenario)
-
-        weights = {
-            "heart_rate": 0.12,
-            "mean_arterial_pressure": 0.18,
-            "respiratory_rate": 0.10,
-            "oxygen_saturation": 0.12,
-            "temperature": 0.08,
-            "lactate": 0.22,
-            "sofa_score": 0.18,
-        }
-
-        bands = {
-            "heart_rate": 80.0,
-            "mean_arterial_pressure": 30.0,
-            "respiratory_rate": 18.0,
-            "oxygen_saturation": 6.0,
-            "temperature": 3.0,
-            "lactate": 6.0,
-            "sofa_score": 10.0,
-        }
-
-        score = 0.0
-        for key, weight in weights.items():
-            diff = abs(state[key] - target[key])
-            score += weight * clamp(1.0 - diff / bands[key], 0.0, 1.0)
-
-        return finalize_score(score)
-
-    def _apply_progression(
-        self,
-        state: Dict[str, float],
-        hidden: Dict[str, Any],
-        scenario: Dict[str, Any],
-    ) -> None:
-        prog = scenario["progression"]
-
-        infection_active = not hidden["interventions"]["administer_antibiotics"]
-        source_uncontrolled = (
-            scenario["requirements"].get("needs_source_control", False)
-            and not hidden["interventions"]["perform_source_control"]
-        )
-        shock_uncontrolled = (
-            state["mean_arterial_pressure"] < 65
-            and scenario["requirements"].get("needs_vasopressors", False)
-            and not hidden["interventions"]["start_vasopressors"]
-        )
-
-        severity_multiplier = 1.0 + 0.12 * max(0, hidden["delay_steps"])
-
-        if infection_active:
-            state["temperature"] += prog.get("temp_increase_if_no_antibiotics", 0.0) * severity_multiplier
-            state["heart_rate"] += prog.get("hr_increase_if_no_antibiotics", 0.0) * severity_multiplier
-            state["respiratory_rate"] += prog.get("rr_increase_if_no_antibiotics", 0.0) * severity_multiplier
-            state["lactate"] += prog.get("lactate_increase_if_no_antibiotics", 0.0) * severity_multiplier
-            state["sofa_score"] += prog.get("sofa_increase_if_no_antibiotics", 0.0) * severity_multiplier
-
-        if source_uncontrolled:
-            state["temperature"] += prog.get("temp_increase_if_no_source_control", 0.0)
-            state["lactate"] += prog.get("lactate_increase_if_no_source_control", 0.0)
-
-        if shock_uncontrolled:
-            state["mean_arterial_pressure"] -= prog.get("map_drop_if_no_vasopressors", 0.0)
-            state["oxygen_saturation"] -= prog.get("spo2_drop_if_no_vasopressors", 0.0)
-
-        if state["oxygen_saturation"] < 93 and not hidden["interventions"]["oxygen_therapy"]:
-            state["heart_rate"] += 1.0
-            state["respiratory_rate"] += 1.0
-
-    def _apply_action(self, action: str, episode: Dict[str, Any]) -> float:
-        scenario = episode["scenario"]
-        state = episode["state"]
-        hidden = episode["hidden"]
-
-        step_reward = -0.01
-        relevant = scenario["requirements"]
-        correct_action_bonus = 0.10
-        wrong_action_penalty = -0.08
-        recent_actions = [item["action"] for item in episode["history"][-2:]]
-
-        if action == "observe":
-            step_reward += 0.01
-
-        elif action == "noop":
-            step_reward -= 0.05
-
-        elif action == "administer_antibiotics":
-            if not hidden["interventions"]["administer_antibiotics"]:
-                hidden["interventions"]["administer_antibiotics"] = True
-                state["temperature"] -= 0.3
-                state["heart_rate"] -= 4.0
-                state["lactate"] -= 0.4
-                state["sofa_score"] -= 0.3
-                step_reward += correct_action_bonus + 0.05
-            else:
-                step_reward -= 0.03
-
-        elif action == "give_fluids":
-            if state["mean_arterial_pressure"] < 70 or state["lactate"] > 2.2:
-                state["mean_arterial_pressure"] += 6.0
-                state["heart_rate"] -= 3.0
-                state["lactate"] -= 0.5
-                step_reward += correct_action_bonus
-                hidden["interventions"]["give_fluids"] = True
-            else:
-                state["oxygen_saturation"] -= 0.5
-                step_reward += wrong_action_penalty
-
-        elif action == "oxygen_therapy":
-            if state["oxygen_saturation"] < 94 or state["respiratory_rate"] > 22:
-                state["oxygen_saturation"] += 3.0
-                state["respiratory_rate"] -= 2.0
-                step_reward += correct_action_bonus
-                hidden["interventions"]["oxygen_therapy"] = True
-            else:
-                step_reward -= 0.03
-
-        elif action == "start_vasopressors":
-            if relevant.get("needs_vasopressors", False) and state["mean_arterial_pressure"] < 65:
-                state["mean_arterial_pressure"] += 10.0
-                state["lactate"] -= 0.4
-                step_reward += 0.14
-                hidden["interventions"]["start_vasopressors"] = True
-            else:
-                state["lactate"] += 0.3
-                step_reward += wrong_action_penalty
-
-        elif action == "perform_source_control":
-            if relevant.get("needs_source_control", False):
-                if not hidden["interventions"]["perform_source_control"]:
-                    hidden["interventions"]["perform_source_control"] = True
-                    state["temperature"] -= 0.2
-                    state["lactate"] -= 0.3
-                    state["sofa_score"] -= 0.2
-                    step_reward += 0.12
-                else:
-                    step_reward -= 0.03
-            else:
-                step_reward += wrong_action_penalty
-
+        if client is not None and local_step_count == 1:
+            action = llm_choose_action(client, state, history, severity)
+            print(f"[LLM ] step={local_step_count} action={action}")
         else:
-            step_reward -= 0.05
+            action = deterministic_action(state, history, severity)
 
-        if len(recent_actions) == 2 and recent_actions[0] == recent_actions[1] == action and action != "observe":
-            step_reward -= 0.04
+        if action not in ALLOWED_ACTIONS:
+            action = deterministic_action(state, history, severity)
 
-        if hidden["interventions"]["administer_antibiotics"]:
-            state["temperature"] -= 0.10
-            state["lactate"] -= 0.15
-            state["sofa_score"] -= 0.05
+        result = http_json("POST", "/step", {"episode_id": episode_id, "action": action})
+        validate_step_response(result)
 
-        if hidden["interventions"]["oxygen_therapy"] and state["oxygen_saturation"] < 97:
-            state["oxygen_saturation"] += 1.0
+        reward = safe_float(result.get("reward"), 0.0)
+        state = dict(result["state"])
+        done = bool(result["done"])
+        backend_score = clamp_open_interval(result["normalized_score"])
+        backend_step = int(result["step_count"])
+        message = str(result.get("message", ""))
 
-        if hidden["interventions"]["start_vasopressors"] and state["mean_arterial_pressure"] < 75:
-            state["mean_arterial_pressure"] += 2.0
-
-        return float(step_reward)
-
-    def _normalize_state(self, state: Dict[str, float]) -> Dict[str, float]:
-        normalized_map = clamp(safe_float(state["mean_arterial_pressure"], 65.0), 35, 140)
-
-        return {
-            "heart_rate": round(clamp(safe_float(state["heart_rate"], 100.0), 40, 180), 2),
-            "systolic_bp": round(clamp(normalized_map + _SBP_OFFSET, 60, 220), 2),
-            "diastolic_bp": round(clamp(normalized_map - _DBP_OFFSET, 30, 140), 2),
-            "mean_arterial_pressure": round(normalized_map, 2),
-            "respiratory_rate": round(clamp(safe_float(state["respiratory_rate"], 20.0), 8, 45), 2),
-            "oxygen_saturation": round(clamp(safe_float(state["oxygen_saturation"], 95.0), 70, 100), 2),
-            "temperature": round(clamp(safe_float(state["temperature"], 37.0), 34, 42.5), 2),
-            "lactate": round(clamp(safe_float(state["lactate"], 2.0), 0.5, 12), 2),
-            "sofa_score": round(clamp(safe_float(state["sofa_score"], 2.0), 0, 24), 2),
-        }
-
-    def _state_payload(self, episode: Dict[str, Any]) -> Dict[str, Any]:
-        score = finalize_score(episode.get("normalized_score", DEFAULT_SAFE_SCORE))
-        cumulative_reward = finalize_reward(episode.get("cumulative_reward", DEFAULT_SAFE_REWARD))
-
-        history_payload = []
-        for item in episode["history"]:
-            history_payload.append(
-                {
-                    "step": int(item["step"]),
-                    "action": str(item["action"]),
-                    "reward": float(finalize_reward(item["reward"])),
-                    "normalized_score": float(finalize_score(item["normalized_score"])),
-                }
-            )
-
-        return {
-            "episode_id": episode["episode_id"],
-            "scenario": episode["scenario"]["name"],
-            "severity": episode["scenario"]["severity"],
-            "step_count": int(episode["step_count"]),
-            "max_steps": int(episode["scenario"]["max_steps"]),
-            "done": bool(episode["done"]),
-            "state": self._normalize_state(episode["state"]),
-            "cumulative_reward": float(cumulative_reward),
-            "normalized_score": float(score),
-            "history": history_payload,
-        }
-
-    def reset(self, scenario_name: str) -> Dict[str, Any]:
-        scenario = load_scenario(scenario_name)
-        initial = deepcopy(scenario["initial_state"])
-
-        map_val = safe_float(initial["mean_arterial_pressure"], 65.0)
-        initial["systolic_bp"] = map_val + _SBP_OFFSET
-        initial["diastolic_bp"] = map_val - _DBP_OFFSET
-
-        episode_id = str(uuid.uuid4())
-        initial_stability = finalize_score(self._stability_score(initial, scenario))
-
-        episode = {
-            "episode_id": episode_id,
-            "scenario": scenario,
-            "state": initial,
-            "step_count": 0,
-            "done": False,
-            "cumulative_reward": 0.0,
-            "normalized_score": float(finalize_score(initial_stability)),
-            "previous_stability": float(finalize_score(initial_stability)),
-            "history": [],
-            "hidden": {
-                "delay_steps": 0,
-                "interventions": {action: False for action in self.ACTIONS},
-            },
-        }
-
-        with self.lock:
-            self.sessions[episode_id] = episode
-
-        return self._state_payload(episode)
-
-    def state(self, episode_id: str) -> Dict[str, Any]:
-        with self.lock:
-            if episode_id not in self.sessions:
-                raise KeyError("Unknown episode_id")
-            return self._state_payload(self.sessions[episode_id])
-
-    def step(self, episode_id: str, action: str) -> Dict[str, Any]:
-        with self.lock:
-            if episode_id not in self.sessions:
-                raise KeyError("Unknown episode_id")
-
-            episode = self.sessions[episode_id]
-
-            if episode["done"]:
-                response = self._state_payload(episode)
-                response.update(
-                    {
-                        "reward": float(finalize_reward(DEFAULT_SAFE_REWARD)),
-                        "message": "episode_complete",
-                    }
-                )
-                return response
-
-            scenario = episode["scenario"]
-            state = episode["state"]
-            hidden = episode["hidden"]
-
-            reward = finalize_reward(self._apply_action(action, episode))
-            self._apply_progression(state, hidden, scenario)
-
-            map_val = safe_float(state["mean_arterial_pressure"], 65.0)
-            state["systolic_bp"] = map_val + _SBP_OFFSET
-            state["diastolic_bp"] = map_val - _DBP_OFFSET
-
-            stability = finalize_score(self._stability_score(state, scenario))
-            delta = stability - finalize_score(episode["previous_stability"])
-            reward = finalize_reward(reward + 0.45 * delta)
-            episode["previous_stability"] = float(stability)
-
-            essential_actions = scenario["requirements"].get("essential_actions", [])
-            missing_essentials = [
-                a for a in essential_actions if not hidden["interventions"].get(a, False)
-            ]
-
-            if missing_essentials:
-                hidden["delay_steps"] += 1
-                reward = finalize_reward(reward - 0.02 * len(missing_essentials))
-
-            normalized = self._normalize_state(state)
-            episode["state"] = normalized
-            episode["step_count"] += 1
-            episode["cumulative_reward"] = safe_float(episode["cumulative_reward"], 0.0) + float(reward)
-
-            term = scenario["termination"]
-
-            stable = (
-                normalized["mean_arterial_pressure"] >= term["stable_map_min"]
-                and normalized["oxygen_saturation"] >= term["stable_spo2_min"]
-                and normalized["lactate"] <= term["stable_lactate_max"]
-                and normalized["sofa_score"] <= term["stable_sofa_max"]
-            )
-
-            deteriorated = (
-                normalized["mean_arterial_pressure"] <= term["critical_map_below"]
-                or normalized["oxygen_saturation"] <= term["critical_spo2_below"]
-                or normalized["lactate"] >= term["critical_lactate_above"]
-            )
-
-            if stable or deteriorated or episode["step_count"] >= scenario["max_steps"]:
-                episode["done"] = True
-
-            rnorm = scenario.get("reward_normalization", {})
-            max_r = safe_float(rnorm.get("max_cumulative_reward", 1.6), 1.6)
-            min_r = safe_float(rnorm.get("min_cumulative_reward", -1.0), -1.0)
-            raw = safe_float(episode["cumulative_reward"], 0.0)
-            denom = max(max_r - min_r, 1e-8)
-
-            score = (raw - min_r) / denom
-            episode["normalized_score"] = float(finalize_score(score))
-
-            step_record = {
-                "step": int(episode["step_count"]),
+        history.append(
+            {
                 "action": action,
-                "reward": float(finalize_reward(reward)),
-                "normalized_score": float(finalize_score(episode["normalized_score"])),
+                "reward": float(reward),
+                "normalized_score": float(backend_score),
+                "message": message,
             }
-            episode["history"].append(step_record)
+        )
 
-            if stable:
-                message = "stable"
-            elif deteriorated:
-                message = "deteriorated"
-            elif episode["done"]:
-                message = "max_steps_reached"
-            else:
-                message = "in_progress"
+        print(
+            f"[STEP] step={backend_step} action={action} reward={reward:+.4f} "
+            f"score={backend_score:.4f} done={done} msg={message}"
+        )
 
-            response = self._state_payload(episode)
-            response.update(
-                {
-                    "reward": float(finalize_reward(reward)),
-                    "message": message,
-                }
+        final_score = backend_score
+
+        if done or backend_step >= MAX_STEPS:
+            final_score = clamp_open_interval(final_score)
+            print(
+                f"[END] scenario={format_scenario_label(scenario)} "
+                f"final_score={final_score:.4f} steps={backend_step}"
             )
-            return response
+            return final_score, history
 
 
-env = SepsisEnvironment()
+def build_final_payload(scores_by_scenario: Dict[str, float]) -> Dict[str, Any]:
+    early = clamp_open_interval(scores_by_scenario.get("early_sepsis", DEFAULT_SAFE_SCORE))
+    severe = clamp_open_interval(scores_by_scenario.get("severe_sepsis", DEFAULT_SAFE_SCORE))
+    shock = clamp_open_interval(scores_by_scenario.get("septic_shock", DEFAULT_SAFE_SCORE))
+    final_score = clamp_open_interval((early + severe + shock) / 3.0)
 
-app = FastAPI(
-    title="Sepsis Management OpenEnv Backend",
-    description="Deterministic sepsis-management environment exposing OpenEnv-style reset, step, and state endpoints.",
-    version="1.6.1",
-)
-
-
-@app.get("/")
-def root():
     return {
-        "message": "Sepsis AI Agent API is running",
-        "endpoints": ["/health", "/reset", "/step", "/state"],
+        "final_score": float(final_score),
+        "task_scores": {
+            "early_sepsis": float(early),
+            "severe_sepsis": float(severe),
+            "septic_shock": float(shock),
+        },
     }
 
 
-@app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
-    return HealthResponse(status="ok")
-
-
-@app.post("/reset", response_model=EpisodeStateResponse)
-def reset(request: Optional[ResetRequest] = Body(default=None)) -> EpisodeStateResponse:
+def main() -> None:
     try:
-        scenario = "early_sepsis"
-        if request is not None and getattr(request, "scenario", None):
-            scenario = request.scenario
+        print(f"[INFO] Waiting for backend at {BACKEND_BASE} ...")
+        if not wait_for_backend(timeout=30.0):
+            print(
+                f"[ERROR] Backend did not become reachable at {BACKEND_BASE} within 30 seconds.",
+                file=sys.stderr,
+            )
+            fallback = build_final_payload({})
+            print(json.dumps(fallback, indent=2, sort_keys=True))
+            sys.exit(1)
 
-        normalized_name = normalize_scenario_name(scenario)
-        payload = env.reset(normalized_name)
-        return EpisodeStateResponse(**payload)
+        print("[INFO] Backend is reachable.")
+        if os.path.exists(OPENENV_PATH):
+            print(f"[INFO] OpenEnv spec: {OPENENV_PATH}")
 
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        client = get_llm_client()
+        scores_by_scenario: Dict[str, float] = {}
+
+        for scenario in SCENARIOS:
+            try:
+                score, _history = run_episode(scenario, client)
+                scores_by_scenario[scenario] = clamp_open_interval(score)
+            except Exception as exc:
+                print(f"[ERROR] scenario={scenario} failed: {exc}", file=sys.stderr)
+                scores_by_scenario[scenario] = DEFAULT_SAFE_SCORE
+
+        payload = build_final_payload(scores_by_scenario)
+        print("[FINAL] submission payload:")
+        print(json.dumps(payload, indent=2, sort_keys=True))
+
+    except SystemExit:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"reset failed: {str(exc)}") from exc
-
-
-@app.get("/state", response_model=EpisodeStateResponse)
-def state(episode_id: str) -> EpisodeStateResponse:
-    try:
-        payload = env.state(episode_id)
-        return EpisodeStateResponse(**payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"state fetch failed: {str(exc)}") from exc
-
-
-@app.post("/step", response_model=StepResponse)
-def step(request: StepRequest) -> StepResponse:
-    try:
-        payload = env.step(request.episode_id, request.action)
-        return StepResponse(**payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"step failed: {str(exc)}") from exc
-
-
-def run_server(host: str = "127.0.0.1", port: int = 7860) -> None:
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+        print(f"[FATAL] inference failed: {exc}", file=sys.stderr)
+        fallback = build_final_payload({})
+        print("[FINAL] fallback payload:")
+        print(json.dumps(fallback, indent=2, sort_keys=True))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    main()
