@@ -9,5 +9,9 @@ COPY . .
 
 EXPOSE 7860
 
-# Use server/app.py as the proper entry point to avoid duplicate server instances
-CMD ["python", "server/app.py"]
+# Set environment variables for proper cleanup and signal handling
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Use exec form to ensure proper signal handling (PID 1 for proper cleanup)
+ENTRYPOINT ["python", "-u", "server/app.py"]

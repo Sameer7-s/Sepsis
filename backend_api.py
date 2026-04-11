@@ -532,6 +532,22 @@ app = FastAPI(
 )
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Handle server startup."""
+    print("[INFO] Backend server starting up")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Handle server shutdown and cleanup."""
+    print("[INFO] Backend server shutting down")
+    # Cleanup sessions
+    with env.lock:
+        env.sessions.clear()
+    print("[INFO] Sessions cleared")
+
+
 @app.get("/")
 def root():
     return {
