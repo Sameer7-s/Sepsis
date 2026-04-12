@@ -1,0 +1,11 @@
+# Core API framework
+fastapi>=0.100.0,<0.115.0
+uvicorn[standard]>=0.23.0,<0.35.0
+pydantic>=2.0.0,<3.0.0
+
+# OpenAI client (used for LLM policy in inference.py)
+openai>=1.0.0,<2.0.0
+httpx>=0.24.0,<1.0.0
+
+# Used by inference.py for HTTP calls (stdlib urllib used; requests kept for compatibility)
+requests>=2.28.0,<3.0.0
