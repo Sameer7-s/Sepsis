@@ -118,25 +118,36 @@ def main() -> None:
         if not wait_for_port_available(port, timeout=2.0):
             print(f"[WARNING] Port {port} appears to be in use, attempting cleanup...")
             force_cleanup_port(port)
-            time.sleep(1)
+            time.sleep(2)
             
             # Try one more time
-            if not wait_for_port_available(port, timeout=2.0):
-                print(f"[WARNING] Port {port} still in use, will attempt to start anyway with SO_REUSEADDR")
+            if not wait_for_port_available(port, timeout=3.0):
+                print(f"[WARNING] Port {port} still in use after cleanup, will attempt to start anyway with SO_REUSEADDR")
         
         print(f"[INFO] Starting server on 0.0.0.0:{port}")
         
-        # Run uvicorn with proper configuration
-        config = uvicorn.Config(
-            app,
-            host="0.0.0.0",
-            port=port,
-            log_level="info",
-            server_header=False,
-            lifespan="on",
-        )
-        server = uvicorn.Server(config)
-        server.run()
+        # Retry logic for port binding with SO_REUSEADDR
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Run uvicorn with proper configuration
+                # Using uvicorn.run() which better respects socket options
+                uvicorn.run(
+                    app,
+                    host="0.0.0.0",
+                    port=port,
+                    log_level="info",
+                    server_header=False,
+                    lifespan="on",
+                )
+                break  # If successful, exit loop
+            except OSError as e:
+                if ("Address already in use" in str(e) or "98" in str(e)) and attempt < max_retries - 1:
+                    print(f"[WARNING] Attempt {attempt + 1} to bind port {port} failed, retrying...")
+                    force_cleanup_port(port)
+                    time.sleep(2)
+                else:
+                    raise
         
     except ValueError as e:
         print(f"[ERROR] {e}", file=sys.stderr)
