@@ -14,14 +14,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
-<<<<<<< HEAD
-print("[START] task=import_probe", flush=True)
-print("[STEP] step=1 reward=0.0", flush=True)
-print("[END] task=import_probe score=0.5 steps=1", flush=True)
-sys.stdout.flush()
-
-=======
->>>>>>> 9597bd10ea6cec1d3e0abfd32314243a9622963c
 BACKEND_BASE: str = os.getenv("SEPSIS_BACKEND_BASE", "http://127.0.0.1:7860").rstrip("/")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "").strip()
 API_BASE_URL: str = os.getenv("API_BASE_URL", "").strip()
