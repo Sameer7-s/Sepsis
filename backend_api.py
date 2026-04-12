@@ -656,11 +656,7 @@ def step(request: StepRequest) -> StepResponse:
         raise HTTPException(status_code=500, detail=f"step failed: {str(exc)}") from exc
 
 
-def run_server(host: str = "127.0.0.1", port: int = 7860) -> None:
-    """Start the server (used by server/app.py)."""
-    uvicorn.run(app, host=host, port=port, log_level="warning")
-
-
 # NOTE: Server startup should ONLY be done via server/app.py
 # This module is meant only to be imported as a FastAPI app module
 # DO NOT run uvicorn directly from this file
+# DO NOT define any run_server() function here - it's unused and causes confusion
