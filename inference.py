@@ -12,11 +12,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # LLM will be skipped if openai package is not available
+
 # Environment variables
 BACKEND_BASE = os.getenv("SEPSIS_BACKEND_BASE", "http://127.0.0.1:7860").rstrip("/")
 MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
 API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
-API_KEY = (os.getenv("API_KEY") or os.getenv("HF_TOKEN") or "").strip()
+HF_TOKEN = (os.getenv("HF_TOKEN") or os.getenv("API_KEY") or "").strip()
 
 OPENENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "openenv.yaml")
 
@@ -120,6 +125,11 @@ def wait_for_backend(timeout: float = 30.0) -> bool:
                 print(f"[DEBUG] Health check attempt {attempt} failed: {e}")
         time.sleep(0.5)
     return False
+
+
+def normalize_severity(value: str) -> str:
+    """Normalize severity level to standard names."""
+    mapping = {
         "early_sepsis": "early",
         "mild": "early",
         "mild_sepsis": "early",
@@ -154,6 +164,10 @@ def llm_action(state: Dict[str, float], history: List[Dict], severity: str) -> O
     Optional LLM policy.
     Falls back to deterministic logic if model endpoint is unavailable.
     """
+    if not OpenAI:
+        # openai package not installed
+        return None
+
     if not MODEL_NAME or MODEL_NAME.strip().startswith("<"):
         return None
 

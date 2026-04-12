@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
-import uvicorn
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCENARIO_DIR = os.path.join(BASE_DIR, "scenarios")
