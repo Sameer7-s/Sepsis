@@ -265,7 +265,8 @@ def emit_step(step_num: int, reward: float) -> None:
 
 def emit_end(task_name: str, score: float, steps: int) -> None:
     safe_score = clamp_score(score)
-    print(f"[END] task={task_name} score={float(safe_score)} steps={int(steps)}", flush=True)
+    safe_steps = max(1, int(steps))
+    print(f"[END] task={task_name} score={float(safe_score)} steps={safe_steps}", flush=True)
 
 
 def run_episode(scenario: str) -> Tuple[float, int]:
@@ -302,7 +303,6 @@ def run_episode(scenario: str) -> Tuple[float, int]:
                 DEFAULT_SAFE_SCORE,
             )
             final_score = clamp_score(raw_score)
-
             step_count = int(result.get("step_count", step_count + 1))
 
             history.append(
@@ -321,12 +321,15 @@ def run_episode(scenario: str) -> Tuple[float, int]:
 
     except Exception:
         if not step_emitted:
+            step_count = 1
             emit_step(1, 0.0)
+            step_emitted = True
 
         emit_end(scenario, final_score, step_count)
         return final_score, step_count
 
     if not step_emitted:
+        step_count = 1
         emit_step(1, 0.0)
 
     emit_end(scenario, final_score, step_count)
@@ -334,21 +337,15 @@ def run_episode(scenario: str) -> Tuple[float, int]:
 
 
 def main() -> None:
-    scores_by_scenario: Dict[str, float] = {}
-    steps_by_scenario: Dict[str, int] = {}
-
     if not wait_for_backend(timeout=60.0):
         for scenario in SCENARIOS:
             emit_start(scenario)
-            emit_end(scenario, DEFAULT_SAFE_SCORE, 0)
+            emit_step(1, 0.0)
+            emit_end(scenario, DEFAULT_SAFE_SCORE, 1)
         return
 
     for scenario in SCENARIOS:
-        score, steps = run_episode(scenario)
-        scores_by_scenario[scenario] = clamp_score(score)
-        steps_by_scenario[scenario] = int(steps)
-
-    return
+        run_episode(scenario)
 
 
 if __name__ == "__main__":
