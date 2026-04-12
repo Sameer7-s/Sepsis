@@ -274,6 +274,7 @@ def run_episode(scenario: str) -> Tuple[float, int]:
     final_score = DEFAULT_SAFE_SCORE
     step_count = 0
     history: List[Dict[str, Any]] = []
+    step_emitted = False
 
     try:
         reset_resp = http_json("POST", "/reset", {"scenario": scenario})
@@ -313,13 +314,20 @@ def run_episode(scenario: str) -> Tuple[float, int]:
             )
 
             emit_step(step_count, reward)
+            step_emitted = True
 
             if done or step_count >= MAX_STEPS:
                 break
 
     except Exception:
+        if not step_emitted:
+            emit_step(1, 0.0)
+
         emit_end(scenario, final_score, step_count)
         return final_score, step_count
+
+    if not step_emitted:
+        emit_step(1, 0.0)
 
     emit_end(scenario, final_score, step_count)
     return final_score, step_count
