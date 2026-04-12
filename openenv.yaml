@@ -13,8 +13,8 @@ metadata:
     septic_shock: hard
 
 runtime:
-  entrypoint: server.app:main
-  backend_entrypoint: python backend_api.py
+  entrypoint: inference:main
+  backend_entrypoint: python -u server/app.py
   max_runtime_minutes: 20
   compute: cpu-only
   memory_limit: 8GB
