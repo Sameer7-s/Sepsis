@@ -14,7 +14,10 @@ from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
 # Evaluator-friendly backend variable
-BACKEND_BASE: str = os.getenv("API_BASE_URL", "http://127.0.0.1:7860").rstrip("/")
+BACKEND_BASE = os.getenv(
+    "API_BASE_URL",
+    "https://sam795-sepsis-ai-agent.hf.space"
+).rstrip("/")
 
 # Optional LLM variables
 MODEL_NAME: str = os.getenv("MODEL_NAME", "").strip()
