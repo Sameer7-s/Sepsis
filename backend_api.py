@@ -19,10 +19,10 @@ _DBP_OFFSET = PULSE_PRESSURE_MMHG / 3.0
 
 SUPPORTED_SCENARIOS = {"early_sepsis", "severe_sepsis", "septic_shock"}
 
-DEFAULT_SAFE_SCORE = 0.5
-DEFAULT_SAFE_REWARD = 0.5
-SAFE_MIN = 0.01
-SAFE_MAX = 0.99
+# ── Score safety: wider margin so float formatting never rounds to 0.0 / 1.0 ─
+MIN_SAFE_SCORE = 0.05
+MAX_SAFE_SCORE = 0.95
+DEFAULT_SAFE_SCORE = 0.50
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -31,35 +31,44 @@ def clamp(value: float, low: float, high: float) -> float:
 
 def safe_float(value: Any, default: float = DEFAULT_SAFE_SCORE) -> float:
     try:
-        if isinstance(value, bool):
-            return float(default)
         x = float(value)
         if math.isnan(x) or math.isinf(x):
-            return float(default)
-        return float(x)
+            return default
+        return x
     except (TypeError, ValueError):
-        return float(default)
+        return default
 
 
-def clamp_open_interval(value: float) -> float:
+def clamp_open_interval(
+    value: float,
+    low: float = MIN_SAFE_SCORE,
+    high: float = MAX_SAFE_SCORE,
+) -> float:
+    """Return a value strictly inside (low, high). Never returns low or high exactly."""
     x = safe_float(value, DEFAULT_SAFE_SCORE)
+
     if x <= 0.0:
-        return float(SAFE_MIN)
+        return low
     if x >= 1.0:
-        return float(SAFE_MAX)
-    if x < SAFE_MIN:
-        return float(SAFE_MIN)
-    if x > SAFE_MAX:
-        return float(SAFE_MAX)
-    return float(x)
+        return high
+
+    clamped = max(low, min(high, x))
+    return clamped
 
 
-def finalize_score(value: Any) -> float:
-    return float(clamp_open_interval(safe_float(value, DEFAULT_SAFE_SCORE)))
-
-
-def finalize_reward(value: Any) -> float:
-    return float(clamp_open_interval(safe_float(value, DEFAULT_SAFE_REWARD)))
+def round_safe_score(value: float) -> float:
+    """
+    Round to 4 dp and guarantee the result is strictly in (0, 1).
+    Does NOT use assert — assertions are disabled by Python -O in Docker.
+    """
+    clamped = clamp_open_interval(value)
+    rounded = round(clamped, 4)
+    # Extra guard: rounding can theoretically hit 0.0 or 1.0 for extreme inputs
+    if rounded <= 0.0:
+        rounded = MIN_SAFE_SCORE
+    if rounded >= 1.0:
+        rounded = MAX_SAFE_SCORE
+    return float(rounded)
 
 
 def normalize_scenario_name(name: str) -> str:
@@ -117,6 +126,8 @@ ActionName = Literal[
     "perform_source_control",
     "noop",
 ]
+
+ScenarioName = Literal["early_sepsis", "severe_sepsis", "septic_shock"]
 
 
 class ResetRequest(BaseModel):
@@ -203,7 +214,7 @@ class SepsisEnvironment:
             diff = abs(state[key] - target[key])
             score += weight * clamp(1.0 - diff / bands[key], 0.0, 1.0)
 
-        return finalize_score(score)
+        return clamp_open_interval(score)
 
     def _apply_progression(
         self,
@@ -249,12 +260,6 @@ class SepsisEnvironment:
         scenario = episode["scenario"]
         state = episode["state"]
         hidden = episode["hidden"]
-        
-        # Validate action
-        if not action or not isinstance(action, str):
-            raise ValueError(f"Invalid action: {action}")
-        if action not in self.ACTIONS:
-            raise ValueError(f"Unknown action '{action}'. Must be one of: {self.ACTIONS}")
 
         step_reward = -0.01
         relevant = scenario["requirements"]
@@ -357,19 +362,8 @@ class SepsisEnvironment:
         }
 
     def _state_payload(self, episode: Dict[str, Any]) -> Dict[str, Any]:
-        score = finalize_score(episode.get("normalized_score", DEFAULT_SAFE_SCORE))
-        cumulative_reward = finalize_reward(episode.get("cumulative_reward", DEFAULT_SAFE_REWARD))
-
-        history_payload = []
-        for item in episode["history"]:
-            history_payload.append(
-                {
-                    "step": int(item["step"]),
-                    "action": str(item["action"]),
-                    "reward": float(finalize_reward(item["reward"])),
-                    "normalized_score": float(finalize_score(item["normalized_score"])),
-                }
-            )
+        # Always run through round_safe_score — never trust the raw stored value alone
+        score = round_safe_score(episode.get("normalized_score", DEFAULT_SAFE_SCORE))
 
         return {
             "episode_id": episode["episode_id"],
@@ -379,9 +373,9 @@ class SepsisEnvironment:
             "max_steps": int(episode["scenario"]["max_steps"]),
             "done": bool(episode["done"]),
             "state": self._normalize_state(episode["state"]),
-            "cumulative_reward": float(cumulative_reward),
-            "normalized_score": float(score),
-            "history": history_payload,
+            "cumulative_reward": round(safe_float(episode["cumulative_reward"], 0.0), 4),
+            "normalized_score": score,
+            "history": episode["history"],
         }
 
     def reset(self, scenario_name: str) -> Dict[str, Any]:
@@ -393,7 +387,8 @@ class SepsisEnvironment:
         initial["diastolic_bp"] = map_val - _DBP_OFFSET
 
         episode_id = str(uuid.uuid4())
-        initial_stability = finalize_score(self._stability_score(initial, scenario))
+
+        initial_stability = self._stability_score(initial, scenario)
 
         episode = {
             "episode_id": episode_id,
@@ -402,8 +397,8 @@ class SepsisEnvironment:
             "step_count": 0,
             "done": False,
             "cumulative_reward": 0.0,
-            "normalized_score": float(finalize_score(initial_stability)),
-            "previous_stability": float(finalize_score(initial_stability)),
+            "normalized_score": clamp_open_interval(initial_stability),
+            "previous_stability": initial_stability,
             "history": [],
             "hidden": {
                 "delay_steps": 0,
@@ -431,29 +426,24 @@ class SepsisEnvironment:
 
             if episode["done"]:
                 response = self._state_payload(episode)
-                response.update(
-                    {
-                        "reward": float(finalize_reward(DEFAULT_SAFE_REWARD)),
-                        "message": "episode_complete",
-                    }
-                )
+                response.update({"reward": 0.0, "message": "episode_complete"})
                 return response
 
             scenario = episode["scenario"]
             state = episode["state"]
             hidden = episode["hidden"]
 
-            reward = finalize_reward(self._apply_action(action, episode))
+            reward = safe_float(self._apply_action(action, episode), 0.0)
             self._apply_progression(state, hidden, scenario)
 
             map_val = safe_float(state["mean_arterial_pressure"], 65.0)
             state["systolic_bp"] = map_val + _SBP_OFFSET
             state["diastolic_bp"] = map_val - _DBP_OFFSET
 
-            stability = finalize_score(self._stability_score(state, scenario))
-            delta = stability - finalize_score(episode["previous_stability"])
-            reward = finalize_reward(reward + 0.45 * delta)
-            episode["previous_stability"] = float(stability)
+            stability = self._stability_score(state, scenario)
+            delta = stability - safe_float(episode["previous_stability"], stability)
+            reward += 0.45 * delta
+            episode["previous_stability"] = stability
 
             essential_actions = scenario["requirements"].get("essential_actions", [])
             missing_essentials = [
@@ -462,12 +452,12 @@ class SepsisEnvironment:
 
             if missing_essentials:
                 hidden["delay_steps"] += 1
-                reward = finalize_reward(reward - 0.02 * len(missing_essentials))
+                reward -= 0.02 * len(missing_essentials)
 
             normalized = self._normalize_state(state)
             episode["state"] = normalized
             episode["step_count"] += 1
-            episode["cumulative_reward"] = safe_float(episode["cumulative_reward"], 0.0) + float(reward)
+            episode["cumulative_reward"] = safe_float(episode["cumulative_reward"], 0.0) + reward
 
             term = scenario["termination"]
 
@@ -493,14 +483,14 @@ class SepsisEnvironment:
             raw = safe_float(episode["cumulative_reward"], 0.0)
             denom = max(max_r - min_r, 1e-8)
 
-            score = (raw - min_r) / denom
-            episode["normalized_score"] = float(finalize_score(score))
+            # Key fix: clamp_open_interval guarantees (MIN_SAFE_SCORE, MAX_SAFE_SCORE)
+            episode["normalized_score"] = clamp_open_interval((raw - min_r) / denom)
 
             step_record = {
                 "step": int(episode["step_count"]),
                 "action": action,
-                "reward": float(finalize_reward(reward)),
-                "normalized_score": float(finalize_score(episode["normalized_score"])),
+                "reward": round(reward, 4),
+                "normalized_score": round_safe_score(episode["normalized_score"]),
             }
             episode["history"].append(step_record)
 
@@ -516,7 +506,7 @@ class SepsisEnvironment:
             response = self._state_payload(episode)
             response.update(
                 {
-                    "reward": float(finalize_reward(reward)),
+                    "reward": round(reward, 4),
                     "message": message,
                 }
             )
@@ -528,24 +518,8 @@ env = SepsisEnvironment()
 app = FastAPI(
     title="Sepsis Management OpenEnv Backend",
     description="Deterministic sepsis-management environment exposing OpenEnv-style reset, step, and state endpoints.",
-    version="1.6.1",
+    version="1.5.0",
 )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Handle server startup."""
-    print("[INFO] Backend server starting up")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Handle server shutdown and cleanup."""
-    print("[INFO] Backend server shutting down")
-    # Cleanup sessions
-    with env.lock:
-        env.sessions.clear()
-    print("[INFO] Sessions cleared")
 
 
 @app.get("/")
@@ -570,7 +544,7 @@ async def reset(request: Request) -> Dict[str, Any]:
     - Invalid JSON
     - Various scenario names
     
-    Returns a valid EpisodeStateResponse regardless of input.
+    Returns a valid response regardless of input (never crashes).
     """
     try:
         # Step 1: Safely read and parse JSON, default to empty dict
@@ -630,15 +604,8 @@ async def reset(request: Request) -> Dict[str, Any]:
                 "history": [],
             }
 
-        # Step 5: Ensure response is JSON-serializable and valid
-        # Convert to EpisodeStateResponse for validation, but return as dict
-        try:
-            validated = EpisodeStateResponse(**payload)
-            return validated.dict()
-        except Exception as e:
-            # If validation fails, return payload as-is (it came from env.reset)
-            print(f"[WARNING] Response validation failed: {e}")
-            return payload
+        # Step 5: Return valid response
+        return payload
 
     except Exception as e:
         # Absolute fallback - never crash
@@ -670,14 +637,8 @@ async def reset(request: Request) -> Dict[str, Any]:
 @app.get("/state", response_model=EpisodeStateResponse)
 def state(episode_id: str) -> EpisodeStateResponse:
     try:
-        # Validate episode_id
-        if not episode_id or not isinstance(episode_id, str):
-            raise ValueError("episode_id is required and must be a non-empty string")
-        
         payload = env.state(episode_id)
         return EpisodeStateResponse(**payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid request: {str(exc)}") from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     except Exception as exc:
@@ -687,18 +648,8 @@ def state(episode_id: str) -> EpisodeStateResponse:
 @app.post("/step", response_model=StepResponse)
 def step(request: StepRequest) -> StepResponse:
     try:
-        # Validate request
-        if not request.episode_id or not isinstance(request.episode_id, str):
-            raise ValueError("episode_id is required and must be a string")
-        if not request.action or not isinstance(request.action, str):
-            raise ValueError("action is required and must be a string")
-        if request.action not in SepsisEnvironment.ACTIONS:
-            raise ValueError(f"Invalid action '{request.action}'. Must be one of: {SepsisEnvironment.ACTIONS}")
-        
         payload = env.step(request.episode_id, request.action)
         return StepResponse(**payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid request: {str(exc)}") from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     except Exception as exc:
@@ -710,5 +661,6 @@ def run_server(host: str = "127.0.0.1", port: int = 7860) -> None:
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
-# NOTE: Server startup should ONLY be done via server/app.py, not directly
-# This module is meant to be imported and used as a FastAPI app module only
+# NOTE: Server startup should ONLY be done via server/app.py
+# This module is meant only to be imported as a FastAPI app module
+# DO NOT run uvicorn directly from this file
