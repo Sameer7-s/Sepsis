@@ -1,7 +1,6 @@
 """
 Sepsis Management OpenEnv — submission-safe standalone inference loop.
-
-FINAL_SUBMISSION_STDOUT_SAFE_V1
+Parser-safe final version.
 """
 
 import json
@@ -14,9 +13,12 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
-BACKEND_BASE: str = os.getenv("SEPSIS_BACKEND_BASE", "http://127.0.0.1:7860").rstrip("/")
+# Evaluator-friendly backend variable
+BACKEND_BASE: str = os.getenv("API_BASE_URL", "http://127.0.0.1:7860").rstrip("/")
+
+# Optional LLM variables
 MODEL_NAME: str = os.getenv("MODEL_NAME", "").strip()
-API_BASE_URL: str = os.getenv("API_BASE_URL", "").strip()
+LLM_API_BASE_URL: str = os.getenv("LLM_API_BASE_URL", "").strip()
 HF_TOKEN: str = (os.getenv("HF_TOKEN") or os.getenv("API_KEY") or "").strip()
 
 SCENARIOS: List[str] = ["early_sepsis", "severe_sepsis", "septic_shock"]
@@ -133,11 +135,8 @@ def llm_action(
     history: List[Dict[str, Any]],
     severity: str,
 ) -> Optional[str]:
-    if not MODEL_NAME or MODEL_NAME.startswith("<"):
-        return None
-    if not API_BASE_URL or API_BASE_URL.startswith("<"):
-        return None
-    if not HF_TOKEN:
+    # Only use LLM if all required LLM settings are present
+    if not MODEL_NAME or not LLM_API_BASE_URL or not HF_TOKEN:
         return None
 
     try:
@@ -146,7 +145,7 @@ def llm_action(
         return None
 
     try:
-        client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+        client = OpenAI(api_key=HF_TOKEN, base_url=LLM_API_BASE_URL)
 
         prompt = (
             "You are a deterministic sepsis-management assistant. "
@@ -251,13 +250,13 @@ def emit_start(task_name: str) -> None:
 
 def emit_step(step_num: int, reward: float) -> None:
     safe_reward = safe_float(reward, 0.0)
-    print(f"[STEP] step={int(step_num)} reward={float(safe_reward)}", flush=True)
+    print(f"[STEP] step={int(step_num)} reward={safe_reward}", flush=True)
 
 
 def emit_end(task_name: str, score: float, steps: int) -> None:
     safe_score = clamp_score(score)
     safe_steps = max(1, int(steps))
-    print(f"[END] task={task_name} score={float(safe_score)} steps={safe_steps}", flush=True)
+    print(f"[END] task={task_name} score={safe_score} steps={safe_steps}", flush=True)
 
 
 def run_episode(scenario: str) -> Tuple[float, int]:
@@ -326,12 +325,6 @@ def run_episode(scenario: str) -> Tuple[float, int]:
 
 
 def main() -> None:
-    # Debug probe: proves stdout parsing sees this file.
-    print("[START] task=debug_probe", flush=True)
-    print("[STEP] step=1 reward=0.0", flush=True)
-    print("[END] task=debug_probe score=0.5 steps=1", flush=True)
-    sys.stdout.flush()
-
     if not wait_for_backend(timeout=60.0):
         for scenario in SCENARIOS:
             emit_start(scenario)
@@ -347,7 +340,7 @@ if __name__ == "__main__":
     try:
         main()
         sys.stdout.flush()
-        sys.stderr.flush()
     except Exception as exc:
+        # Keep stderr only for fatal debug; structured logs stay on stdout
         sys.stderr.write(f"[FATAL] {exc}\n")
         sys.stderr.flush()

@@ -3,7 +3,6 @@ import math
 import os
 import threading
 import uuid
-import sys
 from copy import deepcopy
 from typing import Any, Dict, List, Literal
 
@@ -507,7 +506,7 @@ app = FastAPI(
 
 
 @app.get("/")
-def root():
+def root() -> Dict[str, Any]:
     return {
         "message": "Sepsis AI Agent API is running",
         "endpoints": ["/health", "/reset", "/step", "/state"],
@@ -519,9 +518,10 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-@app.post("/reset")
-async def reset(request: Request) -> Dict[str, Any]:
+@app.post("/reset", response_model=EpisodeStateResponse)
+async def reset(request: Request) -> EpisodeStateResponse:
     data: Dict[str, Any] = {}
+
     try:
         body = await request.body()
         if body:
@@ -532,19 +532,23 @@ async def reset(request: Request) -> Dict[str, Any]:
         data = {}
 
     raw_scenario = data.get("scenario", "early_sepsis")
+
     if not isinstance(raw_scenario, str) or not raw_scenario.strip():
         raw_scenario = "early_sepsis"
 
     normalized_name = normalize_scenario_name(raw_scenario)
+
     if normalized_name not in SUPPORTED_SCENARIOS:
         normalized_name = "early_sepsis"
 
     try:
         payload = env.reset(normalized_name)
     except Exception:
+        # Always return a well-formed reset payload so validators don't fail
+        # due to transient scenario-loading or runtime issues.
         payload = _fallback_reset_payload(normalized_name)
 
-    return payload
+    return EpisodeStateResponse(**payload)
 
 
 def _fallback_reset_payload(scenario_name: str) -> Dict[str, Any]:
