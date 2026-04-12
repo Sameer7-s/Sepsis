@@ -1,19 +1,15 @@
 """
 Sepsis Management — inference entry point.
 
-Validator-required stdout format:
+Output contract (validator-required):
   [START] task=<scenario_name>
-  [STEP] step=<n> reward=<f>
-  [END] task=<scenario_name> score=<f> steps=<n>
+  [STEP]  step=<n> reward=<f>
+  [END]   task=<scenario_name> score=<f> steps=<n>
 
-This version:
-- NEVER starts a server / binds any port
-- Uses backend already running at SEPSIS_BACKEND_BASE (default localhost:7860)
-- Makes real LLM calls through the injected OpenAI-compatible proxy using:
-    API_BASE_URL
-    API_KEY
-    MODEL_NAME
-- Falls back safely if LLM is unavailable
+LLM contract (validator-required):
+  - MUST call the LiteLLM proxy via API_BASE_URL + API_KEY env vars
+  - Use OpenAI client: base_url=os.environ["API_BASE_URL"], api_key=os.environ["API_KEY"]
+  - Do NOT hardcode keys or use other providers
 """
 
 import json
@@ -24,19 +20,13 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
-
-# ── Backend location ───────────────────────────────────────────────────────────
+# ── Backend (already started by HF validator on localhost) ────────────────────
 BASE_URL = os.getenv("SEPSIS_BACKEND_BASE", "http://127.0.0.1:7860").rstrip("/")
 
-# ── Injected LLM proxy variables ───────────────────────────────────────────────
-API_BASE_URL = os.getenv("API_BASE_URL", "").strip()
-API_KEY = os.getenv("API_KEY", "").strip()
-MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
+# ── LLM proxy — injected by the validator; MUST be used ──────────────────────
+API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
+API_KEY      = os.getenv("API_KEY", os.getenv("HF_TOKEN", "dummy-key"))
+MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")   # LiteLLM routes this
 
 SCENARIOS = ["early_sepsis", "severe_sepsis", "septic_shock"]
 
@@ -50,10 +40,24 @@ ALLOWED_ACTIONS = [
     "noop",
 ]
 
+# Deterministic fallback sequence (used only when LLM call fails)
+_FALLBACK_SEQUENCE = [
+    "administer_antibiotics",
+    "give_fluids",
+    "oxygen_therapy",
+    "give_fluids",
+    "start_vasopressors",
+    "perform_source_control",
+    "observe",
+    "observe",
+    "observe",
+    "observe",
+]
+
 DEFAULT_SCORE = 0.50
-MIN_SCORE = 0.05
-MAX_SCORE = 0.95
-MAX_STEPS = 10
+MIN_SCORE     = 0.05
+MAX_SCORE     = 0.95
+MAX_STEPS     = 10
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -69,31 +73,24 @@ def safe_float(value, default: float = DEFAULT_SCORE) -> float:
 
 
 def clamp_score(score: float) -> float:
-    score = safe_float(score, DEFAULT_SCORE)
-    return max(MIN_SCORE, min(MAX_SCORE, score))
+    return max(MIN_SCORE, min(MAX_SCORE, safe_float(score, DEFAULT_SCORE)))
 
 
 def post_json(path: str, payload: dict, timeout: float = 15.0) -> dict:
-    url = f"{BASE_URL}{path}"
+    url  = f"{BASE_URL}{path}"
     data = json.dumps(payload).encode("utf-8")
-    req = Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    req  = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def get_json(path: str, timeout: float = 5.0) -> dict:
-    url = f"{BASE_URL}{path}"
-    req = Request(url, method="GET")
+    req = Request(f"{BASE_URL}{path}", method="GET")
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-# ── Structured output helpers ──────────────────────────────────────────────────
+# ── Structured output ──────────────────────────────────────────────────────────
 
 def emit_start(task: str) -> None:
     print(f"[START] task={task}", flush=True)
@@ -110,8 +107,7 @@ def emit_end(task: str, score: float, steps: int) -> None:
 # ── Backend readiness ──────────────────────────────────────────────────────────
 
 def wait_for_backend(timeout: float = 30.0) -> bool:
-    start = time.time()
-    attempt = 0
+    start, attempt = time.time(), 0
     while time.time() - start < timeout:
         attempt += 1
         try:
@@ -126,107 +122,113 @@ def wait_for_backend(timeout: float = 30.0) -> bool:
     return False
 
 
-# ── LLM proxy usage ────────────────────────────────────────────────────────────
+# ── LLM action selection (REQUIRED by validator) ──────────────────────────────
 
-def get_openai_client():
-    if OpenAI is None:
-        return None
-    if not API_BASE_URL or not API_KEY or not MODEL_NAME:
-        return None
+def _build_llm_prompt(state: dict, history: list, severity: str, scenario: str) -> str:
+    actions_taken = [h["action"] for h in history]
+    return (
+        f"You are an expert sepsis management AI agent.\n"
+        f"Scenario: {scenario} (severity: {severity})\n"
+        f"Current patient state: {json.dumps(state, indent=2)}\n"
+        f"Actions taken so far: {actions_taken}\n\n"
+        f"Choose the single best next action from this list:\n"
+        f"{ALLOWED_ACTIONS}\n\n"
+        f"Clinical guidelines:\n"
+        f"- Always administer antibiotics first if not yet given\n"
+        f"- Give fluids if MAP < 70 or lactate > 2.2\n"
+        f"- Use oxygen_therapy if SpO2 < 94 or RR > 22\n"
+        f"- start_vasopressors only if MAP < 65 AND severity is shock\n"
+        f"- perform_source_control for severe/shock if SOFA >= 4\n"
+        f"- Otherwise observe\n\n"
+        f"Respond with ONLY the action name, nothing else."
+    )
+
+
+def llm_choose_action(state: dict, history: list, severity: str, scenario: str) -> str:
+    """
+    Call the validator's LiteLLM proxy to choose an action.
+    This call is REQUIRED — the validator checks that API_BASE_URL was used.
+    Falls back to deterministic logic only if the call fails.
+    """
+    if not API_BASE_URL:
+        print("[WARN] API_BASE_URL not set — using deterministic fallback", flush=True)
+        return _deterministic_action(state, history)
+
     try:
-        return OpenAI(
+        from openai import OpenAI
+
+        client = OpenAI(
             base_url=API_BASE_URL,
             api_key=API_KEY,
         )
-    except Exception:
-        return None
 
+        prompt = _build_llm_prompt(state, history, severity, scenario)
 
-def llm_proxy_probe() -> None:
-    """
-    Make one guaranteed proxy call so the validator sees usage of the injected LLM.
-    Safe to ignore failures.
-    """
-    client = get_openai_client()
-    if client is None:
-        print("[WARN] LLM proxy not configured; proceeding with fallback policy.", flush=True)
-        return
-
-    try:
-        _ = client.chat.completions.create(
-            model=MODEL_NAME,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": "Reply with exactly: observe"},
-                {"role": "user", "content": "observe"},
-            ],
-        )
-        print("[INFO] LLM proxy probe succeeded.", flush=True)
-    except Exception as exc:
-        print(f"[WARN] LLM proxy probe failed: {exc}", flush=True)
-
-
-def llm_action(state: dict, history: list, scenario: str) -> str | None:
-    client = get_openai_client()
-    if client is None:
-        return None
-
-    prompt = (
-        "You are a sepsis-management assistant. "
-        "Return exactly one action string from this allowed list: "
-        f"{ALLOWED_ACTIONS}. "
-        f"Scenario: {scenario}. "
-        f"Current state: {json.dumps(state)}. "
-        f"Recent history: {json.dumps(history[-3:])}. "
-        "Return only the action string."
-    )
-
-    try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
             temperature=0,
+            max_tokens=20,
             messages=[
                 {
                     "role": "system",
-                    "content": "Return exactly one valid action string and nothing else.",
+                    "content": (
+                        "You are a sepsis management AI. "
+                        "Respond with exactly one action name from the allowed list. "
+                        "No explanation, no punctuation — just the action string."
+                    ),
                 },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
+                {"role": "user", "content": prompt},
             ],
         )
 
-        action = (response.choices[0].message.content or "").strip()
+        raw = (response.choices[0].message.content or "").strip().lower()
+
+        # Strip any punctuation/quotes the model might add
+        action = raw.strip("\"'.`\n ")
+
         if action in ALLOWED_ACTIONS:
+            print(f"[LLM] Chose action: {action}", flush=True)
             return action
-        return None
+
+        # Model returned something garbled — try to fuzzy-match
+        for allowed in ALLOWED_ACTIONS:
+            if allowed in raw:
+                print(f"[LLM] Fuzzy-matched '{raw}' → '{allowed}'", flush=True)
+                return allowed
+
+        print(f"[LLM] Unrecognised response '{raw}' — using deterministic fallback", flush=True)
+        return _deterministic_action(state, history)
+
+    except ImportError:
+        print("[WARN] openai package not available — using deterministic fallback", flush=True)
+        return _deterministic_action(state, history)
+
     except Exception as exc:
-        print(f"[WARN] LLM action failed for {scenario}: {exc}", flush=True)
-        return None
+        print(f"[WARN] LLM call failed: {exc} — using deterministic fallback", flush=True)
+        return _deterministic_action(state, history)
 
 
-def deterministic_action(step_index: int, step_data: dict) -> str:
-    """
-    Safe fallback if LLM is unavailable or returns invalid output.
-    """
-    map_val = safe_float(step_data.get("state", {}).get("mean_arterial_pressure", 75.0), 75.0)
-    spo2 = safe_float(step_data.get("state", {}).get("oxygen_saturation", 95.0), 95.0)
-    lactate = safe_float(step_data.get("state", {}).get("lactate", 2.0), 2.0)
+def _deterministic_action(state: dict, history: list) -> str:
+    """Pure rule-based fallback — never calls any external API."""
+    taken = {h["action"] for h in history}
 
-    if step_index == 0:
+    if "administer_antibiotics" not in taken:
         return "administer_antibiotics"
-    if map_val < 65:
+
+    spo2 = state.get("oxygen_saturation", 100)
+    rr   = state.get("respiratory_rate", 16)
+    map_ = state.get("mean_arterial_pressure", 80)
+    lac  = state.get("lactate", 1.0)
+
+    if spo2 < 90:
+        return "oxygen_therapy"
+    if map_ < 65 and "start_vasopressors" not in taken:
         return "start_vasopressors"
-    if lactate > 2.2 or map_val < 70:
+    if map_ < 70 or lac > 2.2:
         return "give_fluids"
-    if spo2 < 94:
+    if spo2 < 94 or rr > 22:
         return "oxygen_therapy"
-    if step_index == 1:
-        return "give_fluids"
-    if step_index == 2:
-        return "oxygen_therapy"
-    if step_index == 3:
+    if "perform_source_control" not in taken:
         return "perform_source_control"
     return "observe"
 
@@ -237,36 +239,37 @@ def run_task(task: str) -> None:
     emit_start(task)
 
     try:
-        reset_data = post_json("/reset", {"scenario": task})
-        episode_id = reset_data["episode_id"]
+        reset_data  = post_json("/reset", {"scenario": task})
+        episode_id  = reset_data["episode_id"]
+        severity    = reset_data.get("severity", "early")
         final_score = safe_float(reset_data.get("normalized_score", DEFAULT_SCORE))
-        current_state = reset_data.get("state", {})
-        history = []
-
+        history: list = []
         steps = 0
 
+        # Extract flat state dict (handles both flat and nested Observation)
+        raw_state = reset_data.get("state", {})
+        if hasattr(raw_state, "__dict__"):
+            state = dict(raw_state)
+        elif isinstance(raw_state, dict):
+            state = raw_state
+        else:
+            state = {}
+
         while steps < MAX_STEPS:
-            llm_selected = llm_action(current_state, history, task)
-            action = llm_selected if llm_selected in ALLOWED_ACTIONS else deterministic_action(steps, {"state": current_state})
+            # ── LLM call (required by validator) ──────────────────────────────
+            action = llm_choose_action(state, history, severity, task)
 
-            step_data = post_json(
-                "/step",
-                {"episode_id": episode_id, "action": action},
-            )
-
-            reward = safe_float(step_data.get("reward", 0.0), 0.0)
+            step_data   = post_json("/step", {"episode_id": episode_id, "action": action})
+            reward      = safe_float(step_data.get("reward", 0.0), 0.0)
             final_score = safe_float(step_data.get("normalized_score", final_score))
-            current_state = step_data.get("state", current_state)
+            steps      += 1
 
-            history.append(
-                {
-                    "action": action,
-                    "reward": reward,
-                    "score": final_score,
-                }
-            )
+            # Update state for next LLM prompt
+            raw_state = step_data.get("state", {})
+            if isinstance(raw_state, dict):
+                state = raw_state
 
-            steps += 1
+            history.append({"action": action, "reward": reward})
             emit_step(steps, reward)
 
             if step_data.get("done", False):
@@ -293,12 +296,9 @@ def run_task(task: str) -> None:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print(f"[INFO] Backend target: {BASE_URL}", flush=True)
-    print(f"[INFO] API_BASE_URL configured: {bool(API_BASE_URL)}", flush=True)
-    print(f"[INFO] API_KEY configured: {bool(API_KEY)}", flush=True)
-    print(f"[INFO] MODEL_NAME configured: {bool(MODEL_NAME)}", flush=True)
-
-    llm_proxy_probe()
+    print(f"[INFO] Backend target : {BASE_URL}", flush=True)
+    print(f"[INFO] LLM proxy      : {API_BASE_URL or '(not set)'}", flush=True)
+    print(f"[INFO] Model          : {MODEL_NAME}", flush=True)
 
     if not wait_for_backend(timeout=30.0):
         print("[ERROR] Backend unreachable — emitting fallback blocks.", flush=True)
