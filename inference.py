@@ -1,6 +1,8 @@
 """
 Sepsis Management OpenEnv — submission-safe standalone inference loop.
 
+DEBUG_MARKER_PHASE2_STDOUT_FIX_V2
+
 Validator-safe version:
 - NEVER starts a backend server
 - Waits for /health before running episodes
@@ -17,6 +19,7 @@ Validator-safe version:
 import json
 import math
 import os
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -337,6 +340,19 @@ def run_episode(scenario: str) -> Tuple[float, int]:
 
 
 def main() -> None:
+    # ════════════════════════════════════════════════════════════════════════════════════
+    # CRITICAL DEBUG PROBE — If this appears in validator output, file is being executed
+    # If NOT, wrong file is loaded or stdout is not captured
+    # ════════════════════════════════════════════════════════════════════════════════════
+    sys.stdout.flush()
+    print("[START] task=debug_probe", flush=True)
+    sys.stdout.flush()
+    print("[STEP] step=1 reward=0.0", flush=True)
+    sys.stdout.flush()
+    print("[END] task=debug_probe score=0.5 steps=1", flush=True)
+    sys.stdout.flush()
+    
+    # Now run real scenarios
     if not wait_for_backend(timeout=60.0):
         for scenario in SCENARIOS:
             emit_start(scenario)
@@ -349,4 +365,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[FATAL] {e}\n")
+        sys.stderr.flush()
