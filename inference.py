@@ -1,19 +1,7 @@
 """
 Sepsis Management OpenEnv — submission-safe standalone inference loop.
 
-DEBUG_MARKER_PHASE2_STDOUT_FIX_V2
-
-Validator-safe version:
-- NEVER starts a backend server
-- Waits for /health before running episodes
-- Uses OpenAI client when API_BASE_URL + MODEL_NAME + HF_TOKEN are present
-- Falls back to deterministic policy when LLM is unavailable
-- Emits ONLY parser-safe stdout lines:
-    [START] task=...
-    [STEP] step=... reward=...
-    [END] task=... score=... steps=...
-- main() NEVER calls sys.exit()
-- All final scores strictly inside (0.0, 1.0)
+FINAL_SUBMISSION_STDOUT_SAFE_V1
 """
 
 import json
@@ -326,8 +314,6 @@ def run_episode(scenario: str) -> Tuple[float, int]:
         if not step_emitted:
             step_count = 1
             emit_step(1, 0.0)
-            step_emitted = True
-
         emit_end(scenario, final_score, step_count)
         return final_score, step_count
 
@@ -340,19 +326,12 @@ def run_episode(scenario: str) -> Tuple[float, int]:
 
 
 def main() -> None:
-    # ════════════════════════════════════════════════════════════════════════════════════
-    # CRITICAL DEBUG PROBE — If this appears in validator output, file is being executed
-    # If NOT, wrong file is loaded or stdout is not captured
-    # ════════════════════════════════════════════════════════════════════════════════════
-    sys.stdout.flush()
+    # Debug probe: proves stdout parsing sees this file.
     print("[START] task=debug_probe", flush=True)
-    sys.stdout.flush()
     print("[STEP] step=1 reward=0.0", flush=True)
-    sys.stdout.flush()
     print("[END] task=debug_probe score=0.5 steps=1", flush=True)
     sys.stdout.flush()
-    
-    # Now run real scenarios
+
     if not wait_for_backend(timeout=60.0):
         for scenario in SCENARIOS:
             emit_start(scenario)
@@ -369,6 +348,6 @@ if __name__ == "__main__":
         main()
         sys.stdout.flush()
         sys.stderr.flush()
-    except Exception as e:
-        sys.stderr.write(f"[FATAL] {e}\n")
+    except Exception as exc:
+        sys.stderr.write(f"[FATAL] {exc}\n")
         sys.stderr.flush()

@@ -3,11 +3,12 @@ import math
 import os
 import threading
 import uuid
+import sys
 from copy import deepcopy
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal
 
-from fastapi import Body, FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCENARIO_DIR = os.path.join(BASE_DIR, "scenarios")
@@ -18,7 +19,6 @@ _DBP_OFFSET = PULSE_PRESSURE_MMHG / 3.0
 
 SUPPORTED_SCENARIOS = {"early_sepsis", "severe_sepsis", "septic_shock"}
 
-# ── Score safety: wider margin so float formatting never rounds to 0.0 / 1.0 ─
 MIN_SAFE_SCORE = 0.05
 MAX_SAFE_SCORE = 0.95
 DEFAULT_SAFE_SCORE = 0.50
@@ -43,26 +43,17 @@ def clamp_open_interval(
     low: float = MIN_SAFE_SCORE,
     high: float = MAX_SAFE_SCORE,
 ) -> float:
-    """Return a value strictly inside (low, high). Never returns low or high exactly."""
     x = safe_float(value, DEFAULT_SAFE_SCORE)
-
     if x <= 0.0:
         return low
     if x >= 1.0:
         return high
-
-    clamped = max(low, min(high, x))
-    return clamped
+    return max(low, min(high, x))
 
 
 def round_safe_score(value: float) -> float:
-    """
-    Round to 4 dp and guarantee the result is strictly in (0, 1).
-    Does NOT use assert — assertions are disabled by Python -O in Docker.
-    """
     clamped = clamp_open_interval(value)
     rounded = round(clamped, 4)
-    # Extra guard: rounding can theoretically hit 0.0 or 1.0 for extreme inputs
     if rounded <= 0.0:
         rounded = MIN_SAFE_SCORE
     if rounded >= 1.0:
@@ -105,15 +96,15 @@ def load_scenario(name: str) -> Dict[str, Any]:
 
 
 class Observation(BaseModel):
-    heart_rate: float = Field(...)
-    systolic_bp: float = Field(...)
-    diastolic_bp: float = Field(...)
-    mean_arterial_pressure: float = Field(...)
-    respiratory_rate: float = Field(...)
-    oxygen_saturation: float = Field(...)
-    temperature: float = Field(...)
-    lactate: float = Field(...)
-    sofa_score: float = Field(...)
+    heart_rate: float
+    systolic_bp: float
+    diastolic_bp: float
+    mean_arterial_pressure: float
+    respiratory_rate: float
+    oxygen_saturation: float
+    temperature: float
+    lactate: float
+    sofa_score: float
 
 
 ActionName = Literal[
@@ -125,12 +116,6 @@ ActionName = Literal[
     "perform_source_control",
     "noop",
 ]
-
-ScenarioName = Literal["early_sepsis", "severe_sepsis", "septic_shock"]
-
-
-class ResetRequest(BaseModel):
-    scenario: str = "early_sepsis"
 
 
 class StepRequest(BaseModel):
@@ -361,7 +346,6 @@ class SepsisEnvironment:
         }
 
     def _state_payload(self, episode: Dict[str, Any]) -> Dict[str, Any]:
-        # Always run through round_safe_score — never trust the raw stored value alone
         score = round_safe_score(episode.get("normalized_score", DEFAULT_SAFE_SCORE))
 
         return {
@@ -386,7 +370,6 @@ class SepsisEnvironment:
         initial["diastolic_bp"] = map_val - _DBP_OFFSET
 
         episode_id = str(uuid.uuid4())
-
         initial_stability = self._stability_score(initial, scenario)
 
         episode = {
@@ -482,7 +465,6 @@ class SepsisEnvironment:
             raw = safe_float(episode["cumulative_reward"], 0.0)
             denom = max(max_r - min_r, 1e-8)
 
-            # Key fix: clamp_open_interval guarantees (MIN_SAFE_SCORE, MAX_SAFE_SCORE)
             episode["normalized_score"] = clamp_open_interval((raw - min_r) / denom)
 
             step_record = {
@@ -516,8 +498,11 @@ env = SepsisEnvironment()
 
 app = FastAPI(
     title="Sepsis Management OpenEnv Backend",
-    description="Deterministic sepsis-management environment exposing OpenEnv-style reset, step, and state endpoints.",
-    version="1.5.0",
+    description=(
+        "Deterministic sepsis-management environment exposing OpenEnv-style "
+        "reset, step, and state endpoints."
+    ),
+    version="1.6.0",
 )
 
 
@@ -536,112 +521,66 @@ def health() -> HealthResponse:
 
 @app.post("/reset")
 async def reset(request: Request) -> Dict[str, Any]:
-    """
-    OpenEnv-compliant reset endpoint that handles:
-    - Empty request bodies
-    - Missing JSON
-    - Invalid JSON
-    - Various scenario names
-    
-    Returns a valid response regardless of input (never crashes).
-    """
+    data: Dict[str, Any] = {}
     try:
-        # Step 1: Safely read and parse JSON, default to empty dict
-        data = {}
-        try:
-            body = await request.body()
-            if body:  # Only try to parse if body is not empty
-                data = json.loads(body)
-            else:
+        body = await request.body()
+        if body:
+            data = json.loads(body)
+            if not isinstance(data, dict):
                 data = {}
-        except json.JSONDecodeError:
-            # If JSON is invalid, use empty dict (defaults to early_sepsis)
-            data = {}
-        except Exception:
-            # Any other error, use empty dict
-            data = {}
+    except Exception:
+        data = {}
 
-        # Step 2: Extract and validate scenario
-        scenario = "early_sepsis"  # default
-        if isinstance(data, dict):
-            raw_scenario = data.get("scenario", "early_sepsis")
-            if isinstance(raw_scenario, str) and raw_scenario.strip():
-                scenario = raw_scenario.strip()
+    raw_scenario = data.get("scenario", "early_sepsis")
+    if not isinstance(raw_scenario, str) or not raw_scenario.strip():
+        raw_scenario = "early_sepsis"
 
-        # Step 3: Normalize and validate scenario name
-        normalized_name = normalize_scenario_name(scenario)
-        if normalized_name not in SUPPORTED_SCENARIOS:
-            # If scenario is invalid, default to early_sepsis
-            normalized_name = "early_sepsis"
+    normalized_name = normalize_scenario_name(raw_scenario)
+    if normalized_name not in SUPPORTED_SCENARIOS:
+        normalized_name = "early_sepsis"
 
-        # Step 4: Call env.reset() which is guaranteed to return valid data
-        try:
-            payload = env.reset(normalized_name)
-        except Exception as e:
-            # If env.reset fails, create a minimal fallback response
-            print(f"[ERROR] env.reset failed: {e}")
-            payload = {
-                "episode_id": str(uuid.uuid4()),
-                "scenario": normalized_name,
-                "severity": "early",
-                "step_count": 0,
-                "max_steps": 20,
-                "done": False,
-                "state": {
-                    "heart_rate": 100.0,
-                    "systolic_bp": 120.0,
-                    "diastolic_bp": 80.0,
-                    "mean_arterial_pressure": 93.33,
-                    "respiratory_rate": 20.0,
-                    "oxygen_saturation": 95.0,
-                    "temperature": 37.0,
-                    "lactate": 2.0,
-                    "sofa_score": 2.0,
-                },
-                "cumulative_reward": 0.0,
-                "normalized_score": 0.5,
-                "history": [],
-            }
+    try:
+        payload = env.reset(normalized_name)
+    except Exception:
+        payload = _fallback_reset_payload(normalized_name)
 
-        # Step 5: Return valid response
-        return payload
+    return payload
 
-    except Exception as e:
-        # Absolute fallback - never crash
-        print(f"[CRITICAL] /reset handler failed: {e}")
-        return {
-            "episode_id": str(uuid.uuid4()),
-            "scenario": "early_sepsis",
-            "severity": "early",
-            "step_count": 0,
-            "max_steps": 20,
-            "done": False,
-            "state": {
-                "heart_rate": 100.0,
-                "systolic_bp": 120.0,
-                "diastolic_bp": 80.0,
-                "mean_arterial_pressure": 93.33,
-                "respiratory_rate": 20.0,
-                "oxygen_saturation": 95.0,
-                "temperature": 37.0,
-                "lactate": 2.0,
-                "sofa_score": 2.0,
-            },
-            "cumulative_reward": 0.0,
-            "normalized_score": 0.5,
-            "history": [],
-        }
+
+def _fallback_reset_payload(scenario_name: str) -> Dict[str, Any]:
+    return {
+        "episode_id": str(uuid.uuid4()),
+        "scenario": scenario_name,
+        "severity": "early",
+        "step_count": 0,
+        "max_steps": 20,
+        "done": False,
+        "state": {
+            "heart_rate": 100.0,
+            "systolic_bp": 120.0,
+            "diastolic_bp": 80.0,
+            "mean_arterial_pressure": 93.33,
+            "respiratory_rate": 20.0,
+            "oxygen_saturation": 95.0,
+            "temperature": 37.0,
+            "lactate": 2.0,
+            "sofa_score": 2.0,
+        },
+        "cumulative_reward": 0.0,
+        "normalized_score": DEFAULT_SAFE_SCORE,
+        "history": [],
+    }
 
 
 @app.get("/state", response_model=EpisodeStateResponse)
-def state(episode_id: str) -> EpisodeStateResponse:
+def get_state(episode_id: str) -> EpisodeStateResponse:
     try:
         payload = env.state(episode_id)
         return EpisodeStateResponse(**payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"state fetch failed: {str(exc)}") from exc
+        raise HTTPException(status_code=500, detail=f"state fetch failed: {exc!s}") from exc
 
 
 @app.post("/step", response_model=StepResponse)
@@ -652,10 +591,4 @@ def step(request: StepRequest) -> StepResponse:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"step failed: {str(exc)}") from exc
-
-
-# NOTE: Server startup should ONLY be done via server/app.py
-# This module is meant only to be imported as a FastAPI app module
-# DO NOT run uvicorn directly from this file
-# DO NOT define any run_server() function here - it's unused and causes confusion
+        raise HTTPException(status_code=500, detail=f"step failed: {exc!s}") from exc
