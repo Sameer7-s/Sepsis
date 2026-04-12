@@ -1,20 +1,10 @@
 ---
 title: Sepsis AI Agent
-<<<<<<< HEAD
-emoji: 🏥
-colorFrom: pink
-colorTo: gray
-=======
 colorFrom: blue
 colorTo: purple
->>>>>>> 01cf7c9 (fix: resolve merge conflicts)
 sdk: docker
+app_port: 7860
 pinned: false
-<<<<<<< HEAD
-license: mit
-short_description: AI-powered sepsis simulation engine with OpenEnv API
----
-=======
 ---
 
 # Sepsis AI Agent
@@ -29,4 +19,3 @@ This repository contains:
 - backend_api.py
 - inference.py
 - openenv.yaml
->>>>>>> 01cf7c9 (fix: resolve merge conflicts)
